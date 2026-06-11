@@ -1,7 +1,5 @@
 <div align="center">
 
-![Microglia Analysis Framework](assets/microglia_preview.gif)
-
 # Dual-Tiered Microglia–pSyn Analysis Framework
 
 **A Modular Framework for 3D Spatial Point Process Analysis and Explainable Deep Learning in Fluorescence Microscopy**
@@ -9,6 +7,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/pytorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+<img src="assets/microglia_preview.gif" width="400" alt="Microglia Analysis Framework">
 
 </div>
 
