@@ -50,9 +50,3 @@ htmlcov/
 
 .DS_Store
 Thumbs.db
-
-assets/*.gif
-assets/*.png
-assets/*.jpg
-assets/*.jpeg
-!assets/.gitkeep
