@@ -1,10 +1,12 @@
 """
 3D Connected Component Analysis Utilities for OME-Zarr Microglia Data
+=====================================================================
 
 Shared utilities used by both the Napari test script and the ClearML
 production script.
 
-Key functions:
+Key functions
+-------------
 * ``scale_centroids_aniso``  -- anisotropic pixel-to-micrometre scaling
 * ``label_connected_components_3d``  -- 3D CCL + regionprops + scaling
 * ``process_zarr_masks``  -- load masks from a zarr root, run CCL on both
@@ -21,14 +23,16 @@ from skimage.measure import label, regionprops
 
 logger = logging.getLogger(__name__)
 
-
+# ---------------------------------------------------------------------------
 # Physical resolution constants
+# ---------------------------------------------------------------------------
 # Z-axis is much coarser than XY  (confocal microscopy)
 RESOLUTION_UM = np.array([0.5, 0.11, 0.11], dtype=np.float64)  # (Z, Y, X)
 
 
-
-# Step 0.2 Anisotropic scaling of centroid coordinates
+# ---------------------------------------------------------------------------
+# Step 0.2  -- Anisotropic scaling of centroid coordinates
+# ---------------------------------------------------------------------------
 
 def scale_centroids_aniso(
     centroids_px: np.ndarray,
@@ -39,7 +43,7 @@ def scale_centroids_aniso(
     resolution.
 
     Parameters
-    -
+    ----------
     centroids_px : np.ndarray
         Array of shape ``(N, 3)`` with columns ``(Z, Y, X)`` in **pixels**.
     resolution : np.ndarray | None
@@ -47,7 +51,7 @@ def scale_centroids_aniso(
         Defaults to ``[0.5, 0.11, 0.11]``.
 
     Returns
-    -
+    -------
     np.ndarray
         Array of shape ``(N, 3)`` with columns ``(Z, Y, X)`` in **um**.
     """
@@ -61,9 +65,9 @@ def scale_centroids_aniso(
     return centroids_px.astype(np.float64) * resolution
 
 
-
-# Step 0.3 3D connected component labelling + regionprops
-
+# ---------------------------------------------------------------------------
+# Step 0.3  -- 3D connected-component labelling + regionprops
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ObjectInfo:
@@ -101,7 +105,7 @@ def label_connected_components_3d(
     to physical coordinates (um).
 
     Parameters
-    -
+    ----------
     binary_mask : np.ndarray
         3D binary mask of shape ``(Z, Y, X)``.
         Non-zero values are treated as foreground.
@@ -114,7 +118,7 @@ def label_connected_components_3d(
         Default ``3`` (full 3D connectivity).
 
     Returns
-    -
+    -------
     dict
         ``"n_objects"``  : int   -- number of connected components
         ``"label_image"``: np.ndarray  -- integer-labelled image
@@ -133,7 +137,7 @@ def label_connected_components_3d(
             f"binary_mask must be 3D (Z, Y, X), got {binary_mask.ndim}D"
         )
 
-    #  Connected-component labelling 
+    # --- Connected-component labelling ---
     label_img = label(
         binary_mask.astype(bool),
         connectivity=connectivity,
@@ -154,7 +158,7 @@ def label_connected_components_3d(
             "volumes_um3": empty_1,
         }
 
-    #  Region properties 
+    # --- Region properties ---
     props = regionprops(label_img)
 
     centroids_px_list: List[np.ndarray] = []
@@ -193,7 +197,7 @@ def label_connected_components_3d(
             bbox_xmax=bb[5],
         ))
 
-    #  Batch anisotropic scaling of all centroids 
+    # --- Batch anisotropic scaling of all centroids ---
     centroids_px = np.stack(centroids_px_list)  # (N, 3)
     centroids_um = scale_centroids_aniso(centroids_px, resolution)
 
@@ -217,9 +221,9 @@ def label_connected_components_3d(
     }
 
 
-
+# ---------------------------------------------------------------------------
 # High-level: process both masks from a single zarr root
-
+# ---------------------------------------------------------------------------
 
 def process_zarr_masks(
     root,
@@ -230,7 +234,7 @@ def process_zarr_masks(
     group and run 3D connected-component analysis on each.
 
     Parameters
-    -
+    ----------
     root : zarr.Group
         The OME-Zarr root (or FOV sub-group) containing
         ``labels/cell_mask/0`` and ``labels/protein_mask/0``.
@@ -238,7 +242,7 @@ def process_zarr_masks(
         Per-axis resolution ``(dZ, dY, dX)`` in um/px.
 
     Returns
-    -
+    -------
     dict
         ``"cell_mask"`` : result dict from ``label_connected_components_3d``
         ``"protein_mask"`` : result dict from ``label_connected_components_3d``

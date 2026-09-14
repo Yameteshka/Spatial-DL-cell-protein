@@ -1,5 +1,6 @@
 """
 Intensity Normalization Pipeline for Microglia 2.75D Data
+==========================================================
 
 Critical preprocessing module that addresses three key data quality
 challenges in fluorescence microscopy for PD vs HC classification:
@@ -20,6 +21,7 @@ challenges in fluorescence microscopy for PD vs HC classification:
    intensity as a confound rather than true pathology features.
 
 Architecture
+------------
 
 The pipeline has three stages, applied in order:
 
@@ -56,6 +58,7 @@ The pipeline has three stages, applied in order:
              └──────────────────────────────────────────────┘
 
 Integration with ZarrPatchDataset
+----------------------------------
 
 This module is designed to be used in two ways:
 
@@ -73,6 +76,7 @@ B) **Runtime mode** (during __getitem__):
    ``_normalize_patch`` method.
 
 Usage example
+-------------
 
     # Pre-scan: compute stats and run bias test
     from intensity_normalization import (
@@ -98,6 +102,7 @@ Usage example
     dataset.normalization = "intensity_pipeline"
 
 References
+----------
 - Reinhold et al. (2019): "Whole-slide image color normalization
   and stain separation" — percentile-based clipping for digital
   pathology.
@@ -119,7 +124,9 @@ from scipy import stats as scipy_stats
 logger = logging.getLogger(__name__)
 
 
+# =====================================================================
 #  1. Data classes for patient statistics
+# =====================================================================
 
 @dataclass
 class ChannelStats:
@@ -228,7 +235,9 @@ class SpearmanResult:
         return cls(**d)
 
 
+# =====================================================================
 #  2. Compute per-patient intensity statistics
+# =====================================================================
 
 def compute_patient_intensity_stats(
     dataset,              # ZarrPatchDataset (must be preloaded)
@@ -244,6 +253,7 @@ def compute_patient_intensity_stats(
     intensity statistics for each (patient, channel) pair.
 
     Parameters
+    ----------
     dataset : ZarrPatchDataset
         A pre-loaded dataset (``preload_data()`` must have been called
         so that ``_raw_cache`` is populated with raw numpy arrays).
@@ -255,11 +265,13 @@ def compute_patient_intensity_stats(
         Random seed for reproducible patch subsampling.  Default 42.
 
     Returns
+    -------
     Dict[str, PatientStats]
         Mapping from patient_id to PatientStats containing per-channel
         intensity statistics.
 
     Notes
+    -----
     - Statistics are computed on RAW (unnormalized) data.  This is
       critical because we want to detect biases in the raw signal,
       not artifacts introduced by normalization.
@@ -381,7 +393,9 @@ def compute_patient_intensity_stats(
     return all_patient_stats
 
 
+# =====================================================================
 #  3. Compute target statistics (median across patients)
+# =====================================================================
 
 def compute_target_stats(
     patient_stats: Dict[str, PatientStats],
@@ -398,15 +412,18 @@ def compute_target_stats(
     match the target, removing systematic inter-patient variability.
 
     Parameters
+    ----------
     patient_stats : Dict[str, PatientStats]
         Per-patient statistics from ``compute_patient_intensity_stats()``.
 
     Returns
+    -------
     Dict[int, TargetStats]
         Mapping from channel_idx (0=pSyn, 1=IBA1) to TargetStats
         containing the cohort-wide target statistics.
 
     Notes
+    -----
     The alignment formula for a patient's channel is:
 
         aligned = (raw - mu_patient) / sigma_patient * sigma_target + mu_target
@@ -457,7 +474,9 @@ def compute_target_stats(
     return target_stats
 
 
+# =====================================================================
 #  4. Spearman correlation bias test
+# =====================================================================
 
 # Channel name mapping for human-readable output
 _CHANNEL_NAMES = {0: "pSyn", 1: "IBA1"}
@@ -482,17 +501,20 @@ def run_spearman_bias_test(
     normalization (Stage 2) is MANDATORY for that channel.
 
     Parameters
+    ----------
     patient_stats : Dict[str, PatientStats]
         Per-patient statistics from ``compute_patient_intensity_stats()``.
     alpha : float
         Significance level for the Spearman test.  Default 0.05.
 
     Returns
+    -------
     List[SpearmanResult]
         One result per channel with the correlation coefficient,
         p-value, significance flag, and a human-readable verdict.
 
     Notes
+    -----
     - Spearman's rho is used instead of Pearson's r because the
       diagnosis label is binary (0/1), making the relationship
       potentially non-linear.  Spearman's rank-based approach is
@@ -592,7 +614,9 @@ def run_spearman_bias_test(
     return results
 
 
+# =====================================================================
 #  5. IntensityNormalizer — the runtime pipeline
+# =====================================================================
 
 class IntensityNormalizer:
     """
@@ -618,6 +642,7 @@ class IntensityNormalizer:
         dataset.normalization = "intensity_pipeline"
 
     Parameters
+    ----------
     patient_stats : Dict[str, PatientStats]
         Per-patient statistics from ``compute_patient_intensity_stats()``.
     target_stats : Dict[int, TargetStats]
@@ -698,6 +723,7 @@ class IntensityNormalizer:
         Apply the full normalization pipeline to a single patch.
 
         Parameters
+        ----------
         patch : np.ndarray
             Raw patch of shape ``(C_out, Z, H, W)`` with float32 values.
         patient_id : str
@@ -705,6 +731,7 @@ class IntensityNormalizer:
             for cross-patient alignment.
 
         Returns
+        -------
         np.ndarray
             Normalized patch of the same shape, with values
             in [0, 1] after the full pipeline:
@@ -718,7 +745,7 @@ class IntensityNormalizer:
             raw_ch_idx = self._ch_map[c]  # map to OME-Zarr channel index
             ch_data = out[c]  # (Z, H, W) — RAW data
 
-            # Stage 1: Cross-patient alignment (on RAW data)
+            # ── Stage 1: Cross-patient alignment (on RAW data) ──
             # IMPORTANT: Alignment MUST be applied on raw data because
             # the patient stats (mu, sigma) are computed from raw
             # intensities.  Applying them to [0,1]-scaled data would
@@ -730,7 +757,7 @@ class IntensityNormalizer:
                 )
                 ch_data = out[c]  # use aligned data for next stage
 
-            # Stage 2: Percentile clipping + Min-Max [0,1]
+            # ── Stage 2: Percentile clipping + Min-Max [0,1] ────
             # After alignment, clip at percentiles and scale to [0,1].
             out[c] = self._stage2_percentile_clip(
                 ch_data, patient_id, raw_ch_idx,
@@ -738,7 +765,9 @@ class IntensityNormalizer:
 
         return out
 
+    # -----------------------------------------------------------------
     # Stage 1: Cross-Patient Alignment (applied on RAW data)
+    # -----------------------------------------------------------------
 
     def _stage1_cross_patient_align(
         self,
@@ -800,7 +829,9 @@ class IntensityNormalizer:
 
         return aligned.astype(np.float32)
 
+    # -----------------------------------------------------------------
     # Stage 2: Percentile Clipping + Min-Max Scaling (after alignment)
+    # -----------------------------------------------------------------
 
     def _stage2_percentile_clip(
         self,
@@ -859,7 +890,9 @@ class IntensityNormalizer:
         return normalized.astype(np.float32)
 
 
+# =====================================================================
 #  6. Convenience: run the full pre-scan pipeline
+# =====================================================================
 
 def run_full_pre_scan(
     dataset,
@@ -879,6 +912,7 @@ def run_full_pre_scan(
     has been preloaded with ``preload_data()``.
 
     Parameters
+    ----------
     dataset : ZarrPatchDataset
         A pre-loaded dataset.
     alpha : float
@@ -889,6 +923,7 @@ def run_full_pre_scan(
         Random seed for subsampling.  Default 42.
 
     Returns
+    -------
     patient_stats : Dict[str, PatientStats]
     target_stats : Dict[int, TargetStats]
     spearman_results : List[SpearmanResult]
@@ -927,7 +962,9 @@ def run_full_pre_scan(
     return patient_stats, target_stats, spearman_results
 
 
+# =====================================================================
 #  7. Serialization helpers (save/load stats to/from JSON)
+# =====================================================================
 
 # Pipeline version — increment when the pipeline order/semantics
 # change so that cached stats from old versions are invalidated.
@@ -1023,7 +1060,9 @@ def load_stats_from_json(
     return patient_stats, target_stats, spearman_results
 
 
+# =====================================================================
 #  8. Visualization helpers
+# =====================================================================
 
 def plot_patient_intensity_boxplot(
     patient_stats: Dict[str, PatientStats],

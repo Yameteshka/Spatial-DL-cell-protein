@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
 """
 SPP Analysis Pipeline — Spatial Point Process Analysis on 3D Microscopy Data
+=============================================================================
 
 Implements Steps 1.1–1.7 of the SPP pipeline:
   1.1  Nearest-Neighbor Distance (NND) with Guard Zone border correction
@@ -27,6 +29,7 @@ Additional analyses (Steps E–R):
   R    Ridge + Waterfall plot for SN overlap analysis
 
 Input
+-----
   CC3D preprocessing results on MinIO  (JSON per FOV, produced by
   cc3d_production.py).  Each JSON contains:
     - spp_data.type_I_cell.points_um   : cell centroids in μm
@@ -36,11 +39,13 @@ Input
     - fov_window_um                    : 3D observation window bounds
 
 Output
+------
   Per-FOV JSON with SPP metrics, summary CSV, L-function plots,
   LMM/GLMM/permutation results, and publication plots — all uploaded
   to MinIO.
 
 Usage
+-----
     # Run locally (debug):
     CLEARML_DISABLED=true python spp_analysis.py
 
@@ -48,6 +53,7 @@ Usage
     python spp_analysis.py
 
 Mathematical references
+----------------------
   - Baddeley, Rubak, Turner (2015) "Spatial Point Patterns: Methodology
     and Applications with R", CRC Press.
   - Illian et al. (2008) "Statistical Analysis and Modelling of Spatial
@@ -69,7 +75,9 @@ import time
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
+# ---------------------------------------------------------------------------
 # Windows asyncio / SSL fix  —  MUST be before s3fs/aiohttp import
+# ---------------------------------------------------------------------------
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -78,20 +86,26 @@ import pandas as pd
 from scipy.spatial.distance import cdist
 from scipy import stats as sp_stats
 
+# ---------------------------------------------------------------------------
 # Matplotlib — Agg backend for headless ClearML agent
 # MUST be set before importing pyplot or any matplotlib backends.
 # Importing inside functions caused a 14-hour crash on ClearML.
+# ---------------------------------------------------------------------------
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
+# ---------------------------------------------------------------------------
 # Statsmodels — top-level import (was lazy, now eager)
+# ---------------------------------------------------------------------------
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
 
+# ---------------------------------------------------------------------------
 # MinIO env vars
+# ---------------------------------------------------------------------------
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "YOUR_MINIO_ACCESS_KEY")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "YOUR_MINIO_SECRET_KEY")
 os.environ.setdefault("AWS_ENDPOINT_URL", "YOUR_MINIO_ENDPOINT")
@@ -108,12 +122,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Configuration
+# ═══════════════════════════════════════════════════════════════════════════
 
-STORAGE_NAME = "YOUR_STORAGE_NAME"
-CC3D_OUTPUT_PREFIX = "YOUR_OUTPUT_PREFIX/cc3d_analysis"
-SPP_OUTPUT_PREFIX = "YOUR_OUTPUT_PREFIX/spp_analysis"
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "YOUR_LOCAL_CACHE_DIR")
+BUCKET = "YOUR_STORAGE_NAME"
+CC3D_PREFIX = "spp-results/cc3d_analysis"
+SPP_PREFIX = "spp-results/spp_analysis"
+LOCAL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "spp_cache")
 
 # K-function radii (μm)
 # Maximum recommended: 1/4 of smallest window dimension ≈ 12.5/4 ≈ 3.1 μm
@@ -142,7 +158,9 @@ OUTLIER_PATIENTS = ["PD8", "PD10", "HC9"]
 N_PERMUTATIONS = 10000
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Helper: recursively convert numpy types for JSON serialization
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _convert_numpy(obj):
     """Recursively convert numpy types to native Python for JSON."""
@@ -163,7 +181,9 @@ def _convert_numpy(obj):
     return obj
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # MinIO helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _make_s3fs() -> s3fs.S3FileSystem:
     """Create an s3fs filesystem for MinIO."""
@@ -206,7 +226,9 @@ def _retry_s3(fn, *args, max_retries=5, base_delay=2.0, **kwargs):
     raise last_exc
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.1 — Nearest-Neighbor Distance with Guard Zone Border Correction
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # For each microglia cell (Type I point), find the Euclidean distance to
 # the nearest pSyn aggregate (Type II point) in 3D.
@@ -233,6 +255,7 @@ def compute_nnd_guard_zone(
     Guard Zone border correction.
 
     Parameters
+    ----------
     cells_um : (N1, 3) array
         Cell centroids in μm, columns [Z, Y, X].
     proteins_um : (N2, 3) array
@@ -246,6 +269,7 @@ def compute_nnd_guard_zone(
         Guard zone width (μm).
 
     Returns
+    -------
     dict with keys:
         nnd              : 1-D array — NND values for interior cells (μm)
         nearest_volumes  : 1-D array — volume of nearest protein per cell
@@ -264,7 +288,7 @@ def compute_nnd_guard_zone(
     if len(cells_um) == 0 or len(proteins_um) == 0:
         return empty_result
 
-    # Identify interior cells (at least r_max from every edge)
+    # ── Identify interior cells (at least r_max from every edge) ──
     z_lo = fov_window["z_min_um"] + r_max
     z_hi = fov_window["z_max_um"] - r_max
     y_lo = fov_window["y_min_um"] + r_max
@@ -286,10 +310,10 @@ def compute_nnd_guard_zone(
         empty_result["n_border_excluded"] = n_border_excluded
         return empty_result
 
-    # Compute all pairwise distances (n_interior × n_proteins)
+    # ── Compute all pairwise distances (n_interior × n_proteins) ──
     dists = cdist(interior_cells, proteins_um, metric="euclidean")
 
-    # Nearest protein per cell
+    # ── Nearest protein per cell ──
     nearest_idx = dists.argmin(axis=1)
     nnd = dists[np.arange(n_interior), nearest_idx]
     nearest_volumes = protein_volumes[nearest_idx]
@@ -305,7 +329,9 @@ def compute_nnd_guard_zone(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.2 — Overlap Index  (voxel-level mask intersection)
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # Compute the fraction of pSyn voxels that physically overlap with IBA1+
 # microglia voxels.  This is a direct proxy for synucleinophagy
@@ -324,10 +350,12 @@ def compute_overlap_index(
     Compute the percentage of pSyn volume inside IBA1+ cells.
 
     Parameters
+    ----------
     protein_mask : 3-D array  (binary, 0/1 or bool)
     cell_mask    : 3-D array  (binary, 0/1 or bool)
 
     Returns
+    -------
     float — overlap percentage (0–100).
     """
     n_protein = int(np.sum(protein_mask > 0))
@@ -337,12 +365,14 @@ def compute_overlap_index(
     return 100.0 * n_overlap / n_protein
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.3 — Edge-corrected Bivariate K-function (3D)
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # Bivariate Ripley K-function K₁₂(r) with TRANSLATION edge correction
 # for a 3D rectangular parallelepiped observation window W.
 #
-# Formula
+# ── Formula ──
 #
 #   K̂₁₂(r) = |W| / (n₁ · n₂)  ·  Σᵢ∈1 Σⱼ∈2  wᵢⱼ · I(‖xᵢ − xⱼ‖ ≤ r)
 #
@@ -354,18 +384,18 @@ def compute_overlap_index(
 #
 #   |W ∩ (W + d)| = max(0, Lz−|dz|) · max(0, Ly−|dy|) · max(0, Lx−|dx|)
 #
-# Under CSR
+# ── Under CSR ──
 #
 #   K₁₂(r) = (4/3)πr³
 #
-# L-function (3D isotropic normalisation)
+# ── L-function (3D isotropic normalisation) ──
 #
 #   L(r) = ( 3·K(r) / (4π) )^(1/3)
 #   Under CSR:  L(r) = r.
 #   L(r) − r > 0 → clustering (attraction)
 #   L(r) − r < 0 → regularity (repulsion)
 #
-# Mark-weighted K-function
+# ── Mark-weighted K-function ──
 #
 # Because pSyn aggregates are NOT uniform in size, we also compute
 # K^m₁₂(r) where each protein's contribution is weighted by its volume:
@@ -376,7 +406,7 @@ def compute_overlap_index(
 # (same CSR benchmark).  This detects whether LARGER proteins cluster
 # preferentially near cells beyond what is expected by chance.
 #
-# R/spatstat alternative
+# ── R/spatstat alternative ──
 #
 # The same computation can be done via spatstat in R through rpy2:
 #
@@ -397,12 +427,14 @@ def bivariate_K_3d(
     edge correction.
 
     Parameters
+    ----------
     points1 : (n1, 3) — Type I points (cells), μm, [Z, Y, X]
     points2 : (n2, 3) — Type II points (proteins), μm, [Z, Y, X]
     W_dims  : (3,)    — window dimensions [Lz, Ly, Lx] in μm
     r_vals  : 1-D     — radii at which to evaluate K
 
     Returns
+    -------
     K_vals : 1-D array of K₁₂(r) values
     """
     n1, n2 = len(points1), len(points2)
@@ -427,7 +459,7 @@ def bivariate_K_3d(
     valid = overlap_vol > 0
     w_ij = np.where(valid, vol_W / overlap_vol, 0.0)
 
-    # Efficient: sort by distance, use cumulative sum of weights
+    # ── Efficient: sort by distance, use cumulative sum of weights ──
     dists_flat = dists.ravel()
     w_flat = w_ij.ravel()
 
@@ -462,10 +494,12 @@ def mark_weighted_K_3d(
     Under null (independent marks): K^m₁₂(r) = (4/3)πr³ (same as CSR).
 
     Parameters
+    ----------
     points1, points2, W_dims, r_vals : as in bivariate_K_3d
     marks2 : (n2,) array — mark values (volume in μm³) for each protein
 
     Returns
+    -------
     K_m_vals : 1-D array
     """
     n1, n2 = len(points1), len(points2)
@@ -521,7 +555,9 @@ def K_to_L(K_vals: np.ndarray) -> np.ndarray:
     return L
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.4 — Random Labeling null model
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # Null hypothesis H₀:  The labels "cell" and "protein" are exchangeable;
 # the spatial locations are fixed, only the type labels are randomly
@@ -549,6 +585,7 @@ def random_labeling_test(
     Random Labeling Monte Carlo test.
 
     Parameters
+    ----------
     cells_um   : (n1, 3) — cell centroids in μm
     proteins_um: (n2, 3) — protein centroids in μm
     W_dims     : (3,)    — window dimensions in μm
@@ -557,6 +594,7 @@ def random_labeling_test(
     seed       : random seed
 
     Returns
+    -------
     K_sims : (n_sim, len(r_vals)) array of K-functions under null
     """
     n1 = len(cells_um)
@@ -578,7 +616,9 @@ def random_labeling_test(
     return K_sims
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.5 — Global Envelope Test  (Maximum Absolute Deviation)
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # The MAD (Maximum Absolute Deviation) test is a GLOBAL envelope test:
 # it accounts for the fact that we test at multiple radii simultaneously.
@@ -602,12 +642,14 @@ def global_envelope_test(
     Global Envelope Test using Maximum Absolute Deviation (MAD).
 
     Parameters
+    ----------
     K_obs  : (len(r_vals),)  — observed K-function
     K_sims : (n_sim, len(r_vals)) — K-functions under null
     r_vals : radii
     alpha  : significance level (default 0.05)
 
     Returns
+    -------
     dict with keys:
         L_obs        : observed L-function
         L_lo, L_hi   : pointwise (1−α) envelope
@@ -699,7 +741,9 @@ def plot_L_function(
     logger.info("Saved L-function plot: %s", save_path)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.6 — Aggregate SPP metrics per FOV / patient
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # For each FOV compute:
 #   - K₁₂(r) and L(r)   (unweighted)
@@ -725,12 +769,14 @@ def compute_spp_for_fov(
     Run all SPP metrics for a single FOV.
 
     Parameters
+    ----------
     fov_data : dict — the JSON data loaded from MinIO (cc3d result)
     r_vals, r_max_guard, n_sim, seed : SPP parameters
     compute_overlap : if True, download zarr and compute overlap index
     fs : s3fs filesystem (needed for overlap computation)
 
     Returns
+    -------
     dict with SPP results, or None on failure.
     """
     spp = fov_data.get("spp_data", {})
@@ -769,7 +815,7 @@ def compute_spp_for_fov(
         })
         return result
 
-    # Window dimensions
+    # ── Window dimensions ──
     if fov_win is None:
         logger.warning("FOV %s: no fov_window_um — skipping", fov_data.get("fov_id"))
         return None
@@ -780,7 +826,7 @@ def compute_spp_for_fov(
         fov_win["x_max_um"] - fov_win["x_min_um"],
     ])
 
-    # Step 1.1: NND with Guard Zone
+    # ── Step 1.1: NND with Guard Zone ──
     nnd_result = compute_nnd_guard_zone(
         cells_um, proteins_um, prot_vols, fov_win, r_max_guard,
     )
@@ -790,7 +836,7 @@ def compute_spp_for_fov(
     result["n_interior_cells"] = nnd_result["n_interior"]
     result["n_border_excluded"] = nnd_result["n_border_excluded"]
 
-    # Step 1.3: K-function (unweighted + mark-weighted)
+    # ── Step 1.3: K-function (unweighted + mark-weighted) ──
     K_obs = bivariate_K_3d(cells_um, proteins_um, W_dims, r_vals)
     L_obs = K_to_L(K_obs)
     spp_score = float(np.max(L_obs - r_vals))
@@ -802,18 +848,18 @@ def compute_spp_for_fov(
     result["spp_score"] = spp_score
     result["spp_score_marked"] = spp_score_marked
 
-    # Step 1.4: Random Labeling
+    # ── Step 1.4: Random Labeling ──
     K_sims = random_labeling_test(
         cells_um, proteins_um, W_dims, r_vals,
         n_sim=n_sim, seed=seed,
     )
 
-    # Step 1.5: Global Envelope Test
+    # ── Step 1.5: Global Envelope Test ──
     envelope = global_envelope_test(K_obs, K_sims, r_vals)
     result["p_value"] = envelope["p_value"]
     result["T_obs"] = envelope["T_obs"]
 
-    # Step 1.2: Overlap Index (optional — needs zarr download)
+    # ── Step 1.2: Overlap Index (optional — needs zarr download) ──
     overlap_index = None
     if compute_overlap and fs is not None:
         zarr_key = fov_data.get("zarr_key")
@@ -824,7 +870,7 @@ def compute_spp_for_fov(
                 logger.warning("Overlap failed for %s: %s", zarr_key, exc)
     result["overlap_index"] = overlap_index
 
-    # Protein volume statistics (marks)
+    # ── Protein volume statistics (marks) ──
     if len(prot_vols) > 0:
         result["prot_vol_mean"] = float(np.mean(prot_vols))
         result["prot_vol_median"] = float(np.median(prot_vols))
@@ -838,7 +884,7 @@ def compute_spp_for_fov(
         result["prot_vol_iqr"] = None
         result["prot_vol_max"] = None
 
-    # Store full K/L curves
+    # ── Store full K/L curves ──
     result["K_unweighted"] = K_obs.tolist()
     result["K_mark_weighted"] = K_m_obs.tolist()
     result["L_unweighted"] = L_obs.tolist()
@@ -856,10 +902,10 @@ def _compute_overlap_from_zarr(
 ) -> float:
     """Download zarr, compute overlap index, delete local copy."""
     local_name = zarr_key.replace("/", "_")
-    local_path = os.path.join(CACHE_DIR, "overlap_" + local_name)
+    local_path = os.path.join(LOCAL_CACHE_DIR, "overlap_" + local_name)
 
     try:
-        s3_path = f"{STORAGE_NAME}/{zarr_key}"
+        s3_path = f"{BUCKET}/{zarr_key}"
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         _retry_s3(fs.get, s3_path, local_path, recursive=True)
 
@@ -886,7 +932,9 @@ def _compute_overlap_from_zarr(
             shutil.rmtree(local_path, ignore_errors=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP 1.7 — LMM Group Comparison (PD vs HC) with Residual Diagnostics
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # Linear Mixed-Effects Model with Patient_ID as random effect.
 #
@@ -912,6 +960,7 @@ def lmm_comparison(
     Fit Linear Mixed-Effects Models comparing PD vs HC.
 
     Parameters
+    ----------
     df      : DataFrame with columns: patient_id, group, spp_score, etc.
     metric  : response variable name (default 'spp_score').
               If metric starts with 'log_', the base name is extracted for
@@ -920,6 +969,7 @@ def lmm_comparison(
               log-transformed version.
 
     Returns
+    -------
     dict with model summaries, p-values, and residual diagnostics.
     """
     # Extract base name for plot labels (e.g., "log_spp_score" → "spp_score")
@@ -938,7 +988,7 @@ def lmm_comparison(
 
     results = {}
 
-    # Model 1: Random Intercept
+    # ── Model 1: Random Intercept ──
     try:
         model_ri = smf.mixedlm(
             f"{metric} ~ is_pd",
@@ -959,7 +1009,7 @@ def lmm_comparison(
         logger.error("Random Intercept LMM failed: %s", exc)
         results["random_intercept"] = {"error": str(exc)}
 
-    # Model 2: Random Intercept + Random Slope
+    # ── Model 2: Random Intercept + Random Slope ──
     try:
         model_rs = smf.mixedlm(
             f"{metric} ~ is_pd",
@@ -981,7 +1031,7 @@ def lmm_comparison(
         logger.warning("Random Slope LMM failed (often singular): %s", exc)
         results["random_slope"] = {"error": str(exc)}
 
-    # Residual diagnostics
+    # ── Residual diagnostics ──
     resids = results.get("ri_residuals")
     if resids is not None:
         residuals = np.asarray(resids)
@@ -1006,7 +1056,7 @@ def lmm_comparison(
         # Q-Q plot and histogram
         _plot_residual_diagnostics(residuals, metric, results)
 
-    # If use_log and base metric exists, fit original (non-log) too
+    # ── If use_log and base metric exists, fit original (non-log) too ──
     if use_log and base_name != metric and base_name in df.columns:
         df_orig = df.dropna(subset=[base_name]).copy()
         if len(df_orig) >= 10:
@@ -1041,8 +1091,8 @@ def _plot_residual_diagnostics(
         results: Dict[str, Any],
 ) -> None:
     """Create Q-Q plot and histogram of LMM residuals."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    save_path = os.path.join(CACHE_DIR, f"residuals_{metric}.png")
+    os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
+    save_path = os.path.join(LOCAL_CACHE_DIR, f"residuals_{metric}.png")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -1068,7 +1118,9 @@ def _plot_residual_diagnostics(
     results["_residual_plot_path"] = save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Load CC3D results from MinIO
+# ═══════════════════════════════════════════════════════════════════════════
 
 def load_all_results(fs: s3fs.S3FileSystem) -> List[Dict[str, Any]]:
     """
@@ -1077,7 +1129,7 @@ def load_all_results(fs: s3fs.S3FileSystem) -> List[Dict[str, Any]]:
     Returns a list of dicts, one per FOV.
     """
     results = []
-    prefix = f"{STORAGE_NAME}/{CC3D_OUTPUT_PREFIX}/"
+    prefix = f"{BUCKET}/{CC3D_PREFIX}/"
 
     # Walk group/region/patient/fov.json
     for grp in ["HC", "PD"]:
@@ -1108,7 +1160,9 @@ def load_all_results(fs: s3fs.S3FileSystem) -> List[Dict[str, Any]]:
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP E — Quality Filtering
+# ═══════════════════════════════════════════════════════════════════════════
 
 def quality_filter(
         df: pd.DataFrame,
@@ -1121,10 +1175,12 @@ def quality_filter(
     because the guard-zone border correction excludes most observations.
 
     Parameters
+    ----------
     df          : DataFrame with 'n_interior_cells' column.
     min_interior: minimum number of interior cells required.
 
     Returns
+    -------
     Filtered DataFrame.
     """
     n_before = len(df)
@@ -1145,7 +1201,9 @@ def quality_filter(
     return df_out
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP F — Log Transformation of SPP Metrics
+# ═══════════════════════════════════════════════════════════════════════════
 
 def log_transform_metrics(
         df: pd.DataFrame,
@@ -1165,11 +1223,13 @@ def log_transform_metrics(
     log-transformed column.
 
     Parameters
+    ----------
     df      : DataFrame with SPP metric columns.
     metrics : list of column names to transform.
               Default: ["spp_score", "spp_score_marked", "overlap_index"].
 
     Returns
+    -------
     DataFrame with new ``log_`` columns added.
     """
     if metrics is None:
@@ -1196,7 +1256,9 @@ def log_transform_metrics(
     return df
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP K — GLMM (Generalized Estimating Equations with Gamma family)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def glmm_comparison(
         df: pd.DataFrame,
@@ -1211,10 +1273,12 @@ def glmm_comparison(
     outcomes like log-transformed SPP scores.
 
     Parameters
+    ----------
     df     : DataFrame with columns: patient_id, group, {metric}.
     metric : response variable name.
 
     Returns
+    -------
     dict with model summary, coefficients, p-values, and confidence
     intervals.
     """
@@ -1268,7 +1332,9 @@ def glmm_comparison(
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP L — Patient-level Permutation Test
+# ═══════════════════════════════════════════════════════════════════════════
 
 def permutation_test_patient_level(
         df: pd.DataFrame,
@@ -1284,12 +1350,14 @@ def permutation_test_patient_level(
     (14 PD, 13 HC — or whatever the data contains).
 
     Parameters
+    ----------
     df     : DataFrame with columns: patient_id, group, {metric}.
     metric : response variable name.
     n_perm : number of permutations (default N_PERMUTATIONS = 10000).
     seed   : random seed.
 
     Returns
+    -------
     dict with observed_diff, p_value, and perm_distribution.
     """
     # Aggregate to patient level
@@ -1344,7 +1412,9 @@ def permutation_test_patient_level(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP M — Sensitivity Analysis (Outlier Removal)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def sensitivity_analysis(
         df: pd.DataFrame,
@@ -1355,21 +1425,23 @@ def sensitivity_analysis(
     Sensitivity analysis: compare results with and without outlier patients.
 
     Parameters
+    ----------
     df                : DataFrame with columns: patient_id, group, {metric}.
     metric            : response variable name.
     outlier_patients  : list of patient IDs to exclude in sensitivity run.
 
     Returns
+    -------
     dict with LMM and permutation results for full and filtered data.
     """
     results = {}
 
-    # Full data
+    # ── Full data ──
     logger.info("Sensitivity analysis — full data (%d FOVs).", len(df))
     results["full_lmm"] = lmm_comparison(df, metric=metric, use_log=False)
     results["full_permutation"] = permutation_test_patient_level(df, metric=metric)
 
-    # Without outliers
+    # ── Without outliers ──
     df_no = df[~df["patient_id"].isin(outlier_patients)].copy()
     n_removed = len(df) - len(df_no)
     logger.info(
@@ -1387,7 +1459,9 @@ def sensitivity_analysis(
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP N — Region-stratified LMM
+# ═══════════════════════════════════════════════════════════════════════════
 
 def region_stratified_lmm(
         df: pd.DataFrame,
@@ -1397,10 +1471,12 @@ def region_stratified_lmm(
     Run LMM and permutation test separately for each brain region.
 
     Parameters
+    ----------
     df     : DataFrame with columns: patient_id, group, region, {metric}.
     metric : response variable name.
 
     Returns
+    -------
     dict keyed by region name, each value is a dict with 'lmm' and
     'permutation' results.
     """
@@ -1435,7 +1511,9 @@ def region_stratified_lmm(
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP P — Bootstrap Cohen's d
+# ═══════════════════════════════════════════════════════════════════════════
 
 def bootstrap_cohens_d(
         df: pd.DataFrame,
@@ -1451,6 +1529,7 @@ def bootstrap_cohens_d(
     within each group to build a bootstrap distribution of Cohen's d.
 
     Parameters
+    ----------
     df      : DataFrame with columns: patient_id, group, region, {metric}.
     metric  : response variable name.
     region  : if not None, filter to this brain region before computing.
@@ -1458,6 +1537,7 @@ def bootstrap_cohens_d(
     seed    : random seed.
 
     Returns
+    -------
     dict with: d_observed, ci_lo, ci_hi, n_hc, n_pd.
     """
     # Filter to region if specified
@@ -1517,7 +1597,9 @@ def bootstrap_cohens_d(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP P-b — GLMM Gamma for Substantia Nigra
+# ═══════════════════════════════════════════════════════════════════════════
 
 def glmm_gamma_region(
         df: pd.DataFrame,
@@ -1532,11 +1614,13 @@ def glmm_gamma_region(
     appropriate than Gaussian LMM.
 
     Parameters
+    ----------
     df     : DataFrame with columns: patient_id, group, region, {metric}.
     metric : response variable name.
     region : brain region to filter on.
 
     Returns
+    -------
     dict with model summary, coefficients, p-values, and CI.
     """
     if "region" not in df.columns:
@@ -1592,12 +1676,14 @@ def glmm_gamma_region(
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP R — Ridge + Waterfall Plot for Substantia Nigra
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_sn_ridge(
         df: pd.DataFrame,
         metric: str = "log_overlap_index",
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Create a ridge (joy) plot and waterfall chart for Substantia Nigra
@@ -1609,11 +1695,13 @@ def plot_sn_ridge(
     sorted by group, highlighting outlier patients.
 
     Parameters
+    ----------
     df       : DataFrame with patient_id, group, region, {metric}.
     metric   : response variable name.
     save_dir : directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     # Font Setup
@@ -1633,7 +1721,7 @@ def plot_sn_ridge(
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
-    # Left: Ridge plot
+    # ── Left: Ridge plot ──
     hc_patients = patient_means[patient_means["group"] == "HC"].sort_values(metric)
     pd_patients = patient_means[patient_means["group"] == "PD"].sort_values(metric)
 
@@ -1687,7 +1775,7 @@ def plot_sn_ridge(
     ax1.set_xlabel(metric, fontsize=11)
     ax1.set_title('Ridge Plot — Substantia Nigra', fontsize=13)
 
-    # Right: Waterfall chart
+    # ── Right: Waterfall chart ──
     grand_mean = patient_means[metric].mean()
     deviations = patient_means[metric].values - grand_mean
     colors = ['#4C72B0' if g == 'HC' else '#DD8452' for g in patient_means["group"]]
@@ -1728,24 +1816,28 @@ def plot_sn_ridge(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP G — Outlier Identification Plot
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_outlier_identification(
         df: pd.DataFrame,
         metrics: Optional[List[str]] = None,
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Create box plots (HC vs PD) with individual patient means as scatter
     points, highlighting outlier patients.
 
     Parameters
+    ----------
     df      : DataFrame with patient_id, group, and metric columns.
     metrics : list of metrics to plot.
               Default: ["spp_score", "spp_score_marked", "overlap_index"].
     save_dir: directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     if metrics is None:
@@ -1823,12 +1915,14 @@ def plot_outlier_identification(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP H — Filtering Summary Plot
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_filtering_summary(
         df_raw: pd.DataFrame,
         df_filtered: pd.DataFrame,
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Create figure showing before/after quality filtering.
@@ -1837,11 +1931,13 @@ def plot_filtering_summary(
     Right: Q-Q plot of spp_score before and after filtering.
 
     Parameters
+    ----------
     df_raw     : DataFrame before filtering.
     df_filtered: DataFrame after filtering.
     save_dir   : directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -1897,12 +1993,14 @@ def plot_filtering_summary(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP I — Transformed Diagnostics Plot
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_transformed_diagnostics(
         df: pd.DataFrame,
         metric: str = "spp_score",
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Create 2×2 figure comparing raw vs log-transformed metric residuals.
@@ -1915,11 +2013,13 @@ def plot_transformed_diagnostics(
     This demonstrates whether the log transformation improved normality.
 
     Parameters
+    ----------
     df      : DataFrame with metric and log_{metric} columns.
     metric  : base metric name (e.g. 'spp_score').
     save_dir: directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     log_metric = f"log_{metric}"
@@ -2000,12 +2100,14 @@ def plot_transformed_diagnostics(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP O-a — Group Comparison (Patient-level Violin Plot)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_group_comparison_patient_level(
         df: pd.DataFrame,
         metric: str = "log_spp_score",
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Violin + box plot showing HC vs PD at patient level.
@@ -2014,11 +2116,13 @@ def plot_group_comparison_patient_level(
     permutation test is added.
 
     Parameters
+    ----------
     df      : DataFrame with patient_id, group, {metric}.
     metric  : response variable name.
     save_dir: directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     # Aggregate to patient level
@@ -2101,21 +2205,25 @@ def plot_group_comparison_patient_level(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP O-b — Sensitivity Analysis Forest Plot
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_sensitivity_analysis(
         sensitivity_results: Dict[str, Any],
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Forest-plot style figure showing coefficient (is_pd) with 95% CI
     for each analysis variant.
 
     Parameters
+    ----------
     sensitivity_results : output of sensitivity_analysis().
     save_dir            : directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     labels = []
@@ -2191,21 +2299,25 @@ def plot_sensitivity_analysis(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # STEP O-c — Region Comparison Bar Chart
+# ═══════════════════════════════════════════════════════════════════════════
 
 def plot_region_comparison(
         region_results: Dict[str, Dict[str, Any]],
-        save_dir: str = CACHE_DIR,
+        save_dir: str = LOCAL_CACHE_DIR,
 ) -> str:
     """
     Bar chart: mean SPP score by region and group (HC/PD), with SEM
     error bars and p-value annotations.
 
     Parameters
+    ----------
     region_results : output of region_stratified_lmm().
     save_dir       : directory for saving the PNG.
 
     Returns
+    -------
     Path to saved figure.
     """
     if not region_results:
@@ -2283,16 +2395,18 @@ def plot_region_comparison(
     return save_path
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # Main pipeline
+# ═══════════════════════════════════════════════════════════════════════════
 
 def run_pipeline() -> None:
     """Run the full SPP analysis pipeline."""
     t_start = time.time()
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 
     fs = _make_s3fs()
 
-    # Step A: Load CC3D results
+    # ── Step A: Load CC3D results ──
     logger.info("Loading CC3D results from MinIO ...")
     all_fov_data = load_all_results(fs)
 
@@ -2300,7 +2414,7 @@ def run_pipeline() -> None:
         logger.error("No CC3D results found. Aborting.")
         return
 
-    # Step B: Compute SPP metrics for each FOV
+    # ── Step B: Compute SPP metrics for each FOV ──
     logger.info("Computing SPP metrics for %d FOVs ...", len(all_fov_data))
 
     spp_results = []
@@ -2342,7 +2456,7 @@ def run_pipeline() -> None:
         logger.error("No SPP results. Aborting.")
         return
 
-    # Step C: Aggregate into DataFrame
+    # ── Step C: Aggregate into DataFrame ──
     # Select scalar columns for the FOV-level DataFrame
     scalar_cols = [
         "patient_id", "group", "region", "fov_id",
@@ -2363,15 +2477,17 @@ def run_pipeline() -> None:
     df = pd.DataFrame(rows)
     df["is_pd"] = (df["group"] == "PD").astype(int)
 
-    csv_path = os.path.join(CACHE_DIR, "spp_fov_results.csv")
+    csv_path = os.path.join(LOCAL_CACHE_DIR, "spp_fov_results.csv")
     df.to_csv(csv_path, index=False)
     logger.info("FOV-level CSV: %s (%d rows)", csv_path, len(df))
 
+    # ═══════════════════════════════════════════════════════════════
     # Step D: UPLOAD DATA FIRST  (even if plotting fails, data is safe)
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Uploading SPP DATA to MinIO (before plotting!) ...")
 
     # Upload CSV
-    csv_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/spp_fov_results.csv"
+    csv_key = f"{BUCKET}/{SPP_PREFIX}/spp_fov_results.csv"
     try:
         _retry_s3(fs.put, csv_path, csv_key, max_retries=3)
         logger.info("Uploaded CSV to %s", csv_key)
@@ -2382,7 +2498,7 @@ def run_pipeline() -> None:
     n_uploaded = 0
     for r in spp_results:
         json_key = (
-            f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/"
+            f"{BUCKET}/{SPP_PREFIX}/"
             f"{r['group']}/{r['region']}/{r['patient_id']}/{r['fov_id']}_spp.json"
         )
         r_safe = _convert_numpy(r)
@@ -2395,15 +2511,21 @@ def run_pipeline() -> None:
             logger.error("Failed to upload %s: %s", json_key, exc)
     logger.info("Uploaded %d per-FOV SPP JSONs to MinIO.", n_uploaded)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step E: Quality Filtering (n_interior >= 3)
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Applying quality filter (n_interior >= %d) ...", MIN_INTERIOR_CELLS)
     df_filtered = quality_filter(df)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step F: Log Transformation
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Log-transforming SPP metrics ...")
     df_filtered = log_transform_metrics(df_filtered)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step G: Outlier Identification Plot
+    # ═══════════════════════════════════════════════════════════════
     outlier_plot_path = ""
     try:
         outlier_plot_path = plot_outlier_identification(df_filtered)
@@ -2411,7 +2533,9 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("Outlier identification plot failed: %s (non-fatal)", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step H: Filtering Summary Plot
+    # ═══════════════════════════════════════════════════════════════
     filter_plot_path = ""
     try:
         filter_plot_path = plot_filtering_summary(df, df_filtered)
@@ -2419,7 +2543,9 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("Filtering summary plot failed: %s (non-fatal)", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step I: Transformed Diagnostics Plot (before/after Q-Q)
+    # ═══════════════════════════════════════════════════════════════
     transform_plot_paths = []
     for metric in ["spp_score", "spp_score_marked"]:
         try:
@@ -2428,7 +2554,9 @@ def run_pipeline() -> None:
         except Exception as exc:
             logger.warning("Transformed diagnostics plot failed for %s: %s (non-fatal)", metric, exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step J: Standard LMM on log-transformed metrics
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Running LMM group comparison on log-transformed metrics ...")
 
     lmm_results = {}
@@ -2444,7 +2572,7 @@ def run_pipeline() -> None:
             lmm_result = lmm_comparison(df_filtered, metric=metric)
 
             # Save LMM result locally
-            lmm_path = os.path.join(CACHE_DIR, f"lmm_{metric}.json")
+            lmm_path = os.path.join(LOCAL_CACHE_DIR, f"lmm_{metric}.json")
             lmm_safe = _convert_numpy(lmm_result)
             with open(lmm_path, "w") as f:
                 json.dump(lmm_safe, f, indent=2, ensure_ascii=False, default=str)
@@ -2452,7 +2580,7 @@ def run_pipeline() -> None:
             lmm_results[metric] = lmm_result
 
             # Upload LMM result
-            lmm_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/lmm/lmm_{metric}.json"
+            lmm_key = f"{BUCKET}/{SPP_PREFIX}/lmm/lmm_{metric}.json"
             try:
                 _retry_s3(fs.put, lmm_path, lmm_key, max_retries=2)
             except Exception as exc:
@@ -2460,7 +2588,9 @@ def run_pipeline() -> None:
         except Exception as exc:
             logger.error("LMM failed for %s: %s (non-fatal, continuing)", metric, exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step K: GLMM (Gamma GEE)
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Running GLMM (GEE Gamma) comparison ...")
 
     glmm_results = {}
@@ -2471,14 +2601,14 @@ def run_pipeline() -> None:
         try:
             glmm_result = glmm_comparison(df_filtered, metric=metric)
 
-            glmm_path = os.path.join(CACHE_DIR, f"glmm_{metric}.json")
+            glmm_path = os.path.join(LOCAL_CACHE_DIR, f"glmm_{metric}.json")
             glmm_safe = _convert_numpy(glmm_result)
             with open(glmm_path, "w") as f:
                 json.dump(glmm_safe, f, indent=2, ensure_ascii=False, default=str)
             glmm_results[metric] = glmm_result
             logger.info("GLMM result for %s saved.", metric)
 
-            glmm_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/glmm/glmm_{metric}.json"
+            glmm_key = f"{BUCKET}/{SPP_PREFIX}/glmm/glmm_{metric}.json"
             try:
                 _retry_s3(fs.put, glmm_path, glmm_key, max_retries=2)
             except Exception as exc:
@@ -2486,7 +2616,9 @@ def run_pipeline() -> None:
         except Exception as exc:
             logger.error("GLMM failed for %s: %s (non-fatal)", metric, exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step L: Permutation Test (patient-level)
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Running patient-level permutation tests ...")
 
     perm_results = {}
@@ -2497,7 +2629,7 @@ def run_pipeline() -> None:
         try:
             perm_result = permutation_test_patient_level(df_filtered, metric=metric)
 
-            perm_path = os.path.join(CACHE_DIR, f"permutation_{metric}.json")
+            perm_path = os.path.join(LOCAL_CACHE_DIR, f"permutation_{metric}.json")
             # Omit perm_distribution from JSON (too large)
             perm_safe = {k: v for k, v in perm_result.items() if k != "perm_distribution"}
             perm_safe = _convert_numpy(perm_safe)
@@ -2506,7 +2638,7 @@ def run_pipeline() -> None:
             perm_results[metric] = perm_result
             logger.info("Permutation test for %s: p=%.6f", metric, perm_result.get("p_value", float("nan")))
 
-            perm_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/permutation/permutation_{metric}.json"
+            perm_key = f"{BUCKET}/{SPP_PREFIX}/permutation/permutation_{metric}.json"
             try:
                 _retry_s3(fs.put, perm_path, perm_key, max_retries=2)
             except Exception as exc:
@@ -2514,18 +2646,20 @@ def run_pipeline() -> None:
         except Exception as exc:
             logger.error("Permutation test failed for %s: %s (non-fatal)", metric, exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step M: Sensitivity Analysis (without outliers)
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Running sensitivity analysis (outlier removal) ...")
     sensitivity_results = {}
     try:
         sensitivity_results = sensitivity_analysis(df_filtered)
-        sens_path = os.path.join(CACHE_DIR, "sensitivity_analysis.json")
+        sens_path = os.path.join(LOCAL_CACHE_DIR, "sensitivity_analysis.json")
         # Strip large data before JSON serialization
         sens_safe = _convert_numpy(sensitivity_results)
         with open(sens_path, "w") as f:
             json.dump(sens_safe, f, indent=2, ensure_ascii=False, default=str)
 
-        sens_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/sensitivity/sensitivity_analysis.json"
+        sens_key = f"{BUCKET}/{SPP_PREFIX}/sensitivity/sensitivity_analysis.json"
         try:
             _retry_s3(fs.put, sens_path, sens_key, max_retries=2)
         except Exception as exc:
@@ -2533,17 +2667,19 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.error("Sensitivity analysis failed: %s (non-fatal)", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step N: Region-stratified Analysis
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Running region-stratified LMM ...")
     region_results = {}
     try:
         region_results = region_stratified_lmm(df_filtered)
-        region_path = os.path.join(CACHE_DIR, "region_stratified.json")
+        region_path = os.path.join(LOCAL_CACHE_DIR, "region_stratified.json")
         region_safe = _convert_numpy(region_results)
         with open(region_path, "w") as f:
             json.dump(region_safe, f, indent=2, ensure_ascii=False, default=str)
 
-        region_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/region/region_stratified.json"
+        region_key = f"{BUCKET}/{SPP_PREFIX}/region/region_stratified.json"
         try:
             _retry_s3(fs.put, region_path, region_key, max_retries=2)
         except Exception as exc:
@@ -2551,7 +2687,9 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.error("Region-stratified analysis failed: %s (non-fatal)", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step O: Publication Plots
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Generating publication-quality plots ...")
 
     # O-a: Group comparison (patient-level)
@@ -2580,8 +2718,8 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("Region comparison plot failed: %s (non-fatal)", exc)
 
-    # L-function plots (non-fatal)
-    plot_dir = os.path.join(CACHE_DIR, "L_plots")
+    # ── L-function plots (non-fatal) ──
+    plot_dir = os.path.join(LOCAL_CACHE_DIR, "L_plots")
     try:
         os.makedirs(plot_dir, exist_ok=True)
         n_plots = min(20, len(spp_results))
@@ -2606,7 +2744,9 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("L-function plotting failed: %s (non-fatal)", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step P: GLMM Gamma for overlap_index in SN
+    # ═══════════════════════════════════════════════════════════════
     logger.info("=" * 60)
     logger.info("STEP P: GLMM Gamma (overlap_index, SN)")
     all_results = {}
@@ -2619,11 +2759,11 @@ def run_pipeline() -> None:
 
     # Save and upload GLMM Gamma results
     try:
-        glmm_gamma_path = os.path.join(CACHE_DIR, "glmm_gamma_sn.json")
+        glmm_gamma_path = os.path.join(LOCAL_CACHE_DIR, "glmm_gamma_sn.json")
         glmm_gamma_safe = _convert_numpy(all_results)
         with open(glmm_gamma_path, "w") as f:
             json.dump(glmm_gamma_safe, f, indent=2, ensure_ascii=False, default=str)
-        glmm_gamma_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/glmm_gamma/glmm_gamma_sn.json"
+        glmm_gamma_key = f"{BUCKET}/{SPP_PREFIX}/glmm_gamma/glmm_gamma_sn.json"
         try:
             _retry_s3(fs.put, glmm_gamma_path, glmm_gamma_key, max_retries=2)
         except Exception as exc:
@@ -2631,7 +2771,9 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("Failed to save GLMM Gamma results: %s", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step Q: Bootstrap Cohen's d
+    # ═══════════════════════════════════════════════════════════════
     logger.info("=" * 60)
     logger.info("STEP Q: Bootstrap Cohen's d")
     for _metric in ["log_spp_score", "log_overlap_index"]:
@@ -2644,11 +2786,11 @@ def run_pipeline() -> None:
 
     # Save and upload bootstrap results
     try:
-        boot_path = os.path.join(CACHE_DIR, "bootstrap_cohens_d.json")
+        boot_path = os.path.join(LOCAL_CACHE_DIR, "bootstrap_cohens_d.json")
         boot_safe = _convert_numpy(all_results)
         with open(boot_path, "w") as f:
             json.dump(boot_safe, f, indent=2, ensure_ascii=False, default=str)
-        boot_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/bootstrap/bootstrap_cohens_d.json"
+        boot_key = f"{BUCKET}/{SPP_PREFIX}/bootstrap/bootstrap_cohens_d.json"
         try:
             _retry_s3(fs.put, boot_path, boot_key, max_retries=2)
         except Exception as exc:
@@ -2656,23 +2798,27 @@ def run_pipeline() -> None:
     except Exception as exc:
         logger.warning("Failed to save bootstrap results: %s", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step R: SN Ridge + Waterfall plot
+    # ═══════════════════════════════════════════════════════════════
     logger.info("=" * 60)
     logger.info("STEP R: SN Ridge + Waterfall plot")
     ridge_plot_path = ""
     try:
-        ridge_plot_path = plot_sn_ridge(df_filtered, metric="log_overlap_index", save_dir=CACHE_DIR)
+        ridge_plot_path = plot_sn_ridge(df_filtered, metric="log_overlap_index", save_dir=LOCAL_CACHE_DIR)
     except Exception as exc:
         logger.warning("SN ridge plot failed: %s", exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step S: Upload ALL results + plots to MinIO
+    # ═══════════════════════════════════════════════════════════════
     logger.info("Uploading quality-filtered CSV and all plots to MinIO ...")
 
     # Upload quality-filtered CSV
-    filtered_csv_path = os.path.join(CACHE_DIR, "spp_fov_results_filtered.csv")
+    filtered_csv_path = os.path.join(LOCAL_CACHE_DIR, "spp_fov_results_filtered.csv")
     try:
         df_filtered.to_csv(filtered_csv_path, index=False)
-        filtered_csv_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/spp_fov_results_filtered.csv"
+        filtered_csv_key = f"{BUCKET}/{SPP_PREFIX}/spp_fov_results_filtered.csv"
         _retry_s3(fs.put, filtered_csv_path, filtered_csv_key, max_retries=2)
         logger.info("Uploaded filtered CSV to %s", filtered_csv_key)
     except Exception as exc:
@@ -2682,17 +2828,17 @@ def run_pipeline() -> None:
     if os.path.isdir(plot_dir):
         for fname in os.listdir(plot_dir):
             fpath = os.path.join(plot_dir, fname)
-            plot_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/L_plots/{fname}"
+            plot_key = f"{BUCKET}/{SPP_PREFIX}/L_plots/{fname}"
             try:
                 _retry_s3(fs.put, fpath, plot_key, max_retries=2)
             except Exception as exc:
                 logger.warning("Failed to upload plot %s: %s", fname, exc)
 
     # Upload residual plots
-    for fname in os.listdir(CACHE_DIR):
+    for fname in os.listdir(LOCAL_CACHE_DIR):
         if fname.startswith("residuals_") and fname.endswith(".png"):
-            fpath = os.path.join(CACHE_DIR, fname)
-            diag_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/diagnostics/{fname}"
+            fpath = os.path.join(LOCAL_CACHE_DIR, fname)
+            diag_key = f"{BUCKET}/{SPP_PREFIX}/diagnostics/{fname}"
             try:
                 _retry_s3(fs.put, fpath, diag_key, max_retries=2)
             except Exception as exc:
@@ -2708,7 +2854,7 @@ def run_pipeline() -> None:
     ]
     for plot_path, default_name in all_new_plots:
         if plot_path and os.path.isfile(plot_path):
-            plot_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/plots/{os.path.basename(plot_path)}"
+            plot_key = f"{BUCKET}/{SPP_PREFIX}/plots/{os.path.basename(plot_path)}"
             try:
                 _retry_s3(fs.put, plot_path, plot_key, max_retries=2)
                 logger.info("Uploaded plot %s", plot_key)
@@ -2717,22 +2863,26 @@ def run_pipeline() -> None:
 
     for plot_path in transform_plot_paths + group_plot_paths:
         if plot_path and os.path.isfile(plot_path):
-            plot_key = f"{STORAGE_NAME}/{SPP_OUTPUT_PREFIX}/plots/{os.path.basename(plot_path)}"
+            plot_key = f"{BUCKET}/{SPP_PREFIX}/plots/{os.path.basename(plot_path)}"
             try:
                 _retry_s3(fs.put, plot_path, plot_key, max_retries=2)
                 logger.info("Uploaded plot %s", plot_key)
             except Exception as exc:
                 logger.warning("Failed to upload plot %s: %s", plot_path, exc)
 
+    # ═══════════════════════════════════════════════════════════════
     # Step T: Cleanup
+    # ═══════════════════════════════════════════════════════════════
     elapsed = time.time() - t_start
     logger.info("SPP pipeline completed in %.1f minutes.", elapsed / 60.0)
 
-    if os.path.isdir(CACHE_DIR):
-        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    if os.path.isdir(LOCAL_CACHE_DIR):
+        shutil.rmtree(LOCAL_CACHE_DIR, ignore_errors=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
 # ClearML entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     clearml_disabled = os.environ.get("CLEARML_DISABLED", "").lower() in (
@@ -2749,7 +2899,7 @@ if __name__ == "__main__":
         # scikit-image auto-detected by ClearML from import
 
         task = Task.init(
-            project_name="YOUR_CLEARML_PROJECT",
+            project_name="SPP_training",
             task_name="SPP_Analysis_Pipeline",
             task_type=Task.TaskTypes.data_processing,
         )

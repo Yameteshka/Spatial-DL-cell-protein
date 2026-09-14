@@ -1,10 +1,12 @@
 """
 Unified 5-Fold GroupKFold Training Pipeline — Models A, B, C
+=============================================================
 
 Trains ALL THREE models (A=IBA1, B=pSyn, C=both) simultaneously in a
 single ClearML task using GroupKFold(5) cross-validation.
 
 Key design decisions
+--------------------
 1. **Unified Dataloader**: Dataset outputs (2, 25, H, W) with model_type="C".
    After reshape to (50, H, W):
      - Channels  0-24 = IBA1 z-slices  (Model A input)
@@ -31,6 +33,7 @@ Key design decisions
    (mean) for AUC computation during validation/test.
 
 Usage
+-----
     python train_unified_5fold.py
 
 Designed for ClearML remote execution but works locally too.
@@ -38,7 +41,9 @@ Designed for ClearML remote execution but works locally too.
 
 from __future__ import annotations
 
+# ==================================================================
 #  0.  MinIO + ClearML setup BEFORE any other imports
+# ==================================================================
 
 import os
 
@@ -60,11 +65,13 @@ Task.add_requirements("matplotlib")
 Task.add_requirements("pandas")
 Task.add_requirements("seaborn")
 
-# Default hyper-parameters (overridable from ClearML UI)
+# ── Default hyper-parameters (overridable from ClearML UI) ────
 _params = dict(
     # Dataset
     architecture    = "cnn",
-    region          = "putamen",       # "putamen" or "substantiaNigra" (or other region name)
+    region          = "putamen",       # set per-loop at runtime
+    regions         = "substantiaNigra,putamen",   # comma-separated
+    seeds           = "42,43,44",                  # comma-separated
     patch_size      = 256,
     target_z        = 25,
     stride          = 236,
@@ -83,26 +90,28 @@ _params = dict(
     num_workers     = 8,
     seed            = 42,
     # Pre-loading
-    cache_dir  = "YOUR_LOCAL_CACHE_DIR",
+    local_cache_dir  = "/tmp/zarr_cache",
     preload_to_ram   = True,
     max_ram_gb       = 64.0,
     max_workers      = 8,
     # ClearML Dataset
-    clearml_dataset_project = "YOUR_CLEARML_PROJECT",
-    clearml_dataset_name    = "YOUR_CLEARML_DATASET_NAME",
+    clearml_dataset_project = "YOUR_STORAGE_NAME/DL_Training",
+    clearml_dataset_name    = "zarr_microglia_data",
     # Queue
-    queue_name      = "1xA100",
+    queue_name      = "YOUR_QUEUE_NAME",
 )
 
 task = Task.init(
-    project_name="YOUR_CLEARML_PROJECT",
-    task_name=f"Unified_ABC_{_params['architecture']}_{_params['region']}",
+    project_name="YOUR_STORAGE_NAME/DL_Training",
+    task_name=f"Unified_ABC_{_params['architecture']}_ALL_v3",
 )
 
 task.connect(_params)
 task.execute_remotely(queue_name=_params["queue_name"])
 
+# ==================================================================
 #  1.  Imports
+# ==================================================================
 
 import copy
 import io
@@ -152,7 +161,7 @@ from sklearn.metrics import (
     roc_curve,
     confusion_matrix,
 )
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from torchvision.models import resnet18, ResNet18_Weights
 
 # Project-local imports
@@ -165,45 +174,63 @@ from zarr_patch_dataset import (
 from intensity_normalization import (
     run_full_pre_scan,
     compute_target_stats,
+    run_spearman_bias_test,
     IntensityNormalizer,
     save_stats_to_json,
     load_stats_from_json,
 )
 
+import gc
+
 logger = logging.getLogger(__name__)
 
+# Per-donor intensity statistics, filled by main() before run_training().
+_GLOBAL_PATIENT_STATS = {}
 
+
+# ==================================================================
 #  2.  Configuration
+# ==================================================================
 
-# MinIO (fixed)
+# ── MinIO (fixed) ─────────────────────────────────────────────
 MINIO_ENDPOINT  = "YOUR_MINIO_ENDPOINT"
 MINIO_ACCESS    = "YOUR_MINIO_ACCESS_KEY"
 MINIO_SECRET    = "YOUR_MINIO_SECRET_KEY"
-MINIO_STORAGE_NAME    = "YOUR_STORAGE_NAME"
+MINIO_BUCKET    = "YOUR_STORAGE_NAME"
 MINIO_BASE      = "YOUR_BASE_PREFIX"
 
-# New results root on MinIO
-MINIO_OUTPUT_PREFIX = "YOUR_OUTPUT_PREFIX"
+# ── New results root on MinIO ─────────────────────────────────
+MINIO_RESULTS_ROOT = "YOUR_OUTPUT_PREFIX"
 
-PATCH_INDEX_MINIO = "YOUR_OUTPUT_PREFIX/_system/patch_index_FROM_CLEARML.json"
+PATCH_INDEX_MINIO = "YOUR_STORAGE_NAME/YOUR_BASE_PREFIX/_system/patch_index_FROM_CLEARML.json"
 LOCAL_INDEX_PATH  = "/tmp/patch_index_FROM_CLEARML.json"
 
-# Outlier patients excluded from ML dataset
+# ── Outlier patients excluded from ML dataset ────────────────
 EXCLUDED_PATIENTS = {"PD8", "PD10", "HC9"}
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _tag() -> str:
+    """Suffix that keeps ClearML scalar series separate across seeds."""
+    return f"s{int(_params['seed'])}"
+
+
 def minio_path(model_type: str, region: str, *parts: str) -> str:
     """Build MinIO key: YOUR_OUTPUT_PREFIX/{MODEL_TYPE}_{ARCH}/{REGION}/{parts}"""
     arch = _params["architecture"]
-    base = f"{MINIO_OUTPUT_PREFIX}/{model_type}_{arch}/{region}"
+    # v2 runs are written under their own prefix, one directory per seed,
+    # so repeated cross-validation runs never overwrite each other.
+    base = (f"{MINIO_RESULTS_ROOT}_v2/seed{int(_params['seed'])}"
+            f"/{model_type}_{arch}/{region}")
     if parts:
         base += "/" + "/".join(parts)
     return base
 
 
+# ==================================================================
 #  3.  Smart Conv1 Initialization + Model Creation
+# ==================================================================
 
 def _smart_conv1_init(in_channels: int, pretrained_conv1_weight: torch.Tensor) -> nn.Conv2d:
     """
@@ -285,7 +312,7 @@ def create_model(
     for param in model.layer2.parameters():
         param.requires_grad = False
 
-    # Calibrate BN running stats on microscopy data
+    # ── Calibrate BN running stats on microscopy data ──────────
     # ImageNet running stats are INVALID after smart_conv1_init
     # replaces 3-channel conv1 with 25/50-channel conv1.
     # We must re-compute running_mean/running_var on actual data
@@ -293,8 +320,8 @@ def create_model(
     if calibration_loader is not None:
         logger.info("Calibrating BN running stats on microscopy data ...")
 
-        # Fix: move the model to the GPU before calibration.
-        # Otherwise the input is on GPU and the weights are on CPU, which raises a RuntimeError.
+        # ИСПРАВЛЕНИЕ: перенести модель на GPU ДО калибровки!
+        # Без этого вход на GPU, а веса на CPU → RuntimeError
         model = model.to(DEVICE)
 
         model.train()
@@ -322,7 +349,7 @@ def create_model(
                 B, C, Z, H, W = tensors.shape
                 x = tensors.reshape(B, C * Z, H, W)
                 x_input = x[:, ch_slice, :, :]
-                _ = model(x_input)  # Now both the data and the model are on the GPU.
+                _ = model(x_input)  # теперь и данные, и модель на GPU ✅
                 n_cal_batches += 1
                 if n_cal_batches >= 50:
                     break
@@ -355,7 +382,9 @@ def create_model(
     return model
 
 
+# ==================================================================
 #  4.  Utility helpers
+# ==================================================================
 
 def seed_everything(seed: int) -> None:
     """Reproducibility helper."""
@@ -368,7 +397,7 @@ def seed_everything(seed: int) -> None:
 
 
 def upload_to_minio(local_path: str, minio_key: str, fs: s3fs.S3FileSystem) -> None:
-    s3_uri = f"{MINIO_STORAGE_NAME}/{minio_key}"
+    s3_uri = f"{MINIO_BUCKET}/{minio_key}"
     try:
         fs.put(local_path, s3_uri)
         logger.info("Uploaded -> s3://%s", s3_uri)
@@ -377,7 +406,7 @@ def upload_to_minio(local_path: str, minio_key: str, fs: s3fs.S3FileSystem) -> N
 
 
 def upload_bytes_to_minio(data: bytes, minio_key: str, fs: s3fs.S3FileSystem) -> None:
-    s3_uri = f"{MINIO_STORAGE_NAME}/{minio_key}"
+    s3_uri = f"{MINIO_BUCKET}/{minio_key}"
     try:
         with fs.open(s3_uri, "wb") as f:
             f.write(data)
@@ -397,19 +426,28 @@ def _report_image_to_clearml(
     png_bytes: bytes, iteration: int = 0,
 ) -> None:
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        # ClearML uploads asynchronously. Deleting the file straight after the
+        # call raced the uploader and every figure was dropped with
+        # "Skipping upload, could not find object file". Keep the files for the
+        # lifetime of the task instead -- they are a few hundred KB each.
+        _img_dir = "/tmp/clearml_report_images"
+        os.makedirs(_img_dir, exist_ok=True)
+        _safe = "".join(c if c.isalnum() or c in "-_." else "_"
+                        for c in f"{title}_{series}_{iteration}")
+        tmp_path = os.path.join(_img_dir, _safe + ".png")
+        with open(tmp_path, "wb") as tmp:
             tmp.write(png_bytes)
-            tmp_path = tmp.name
         clearml_task.get_logger().report_image(
             title, series, iteration=iteration, local_path=tmp_path,
         )
-        os.unlink(tmp_path)
     except Exception as exc:
         logger.warning("Failed to report image to ClearML (%s/%s): %s",
                        title, series, exc)
 
 
+# ==================================================================
 #  5.  Unified Training / Evaluation
+# ==================================================================
 
 def train_one_epoch(
     models: Dict[str, nn.Module],
@@ -441,7 +479,7 @@ def train_one_epoch(
         labels  = torch.tensor(metas["label"], dtype=torch.long, device=device)
         batch_size = tensors.size(0)
 
-        # Reshape to (B, 50, H, W)
+        # ── Reshape to (B, 50, H, W) ──────────────────────────
         B, C, Z, H, W = tensors.shape
         x = tensors.reshape(B, C * Z, H, W)  # (B, 50, H, W)
 
@@ -562,7 +600,9 @@ def evaluate(
     return results
 
 
+# ==================================================================
 #  6.  Patient-level AUC
+# ==================================================================
 
 def compute_patient_auc(
     probs: List[float],
@@ -607,7 +647,9 @@ def compute_patient_auc(
     return pauc, patient_details
 
 
+# ==================================================================
 #  7.  Visualisation helpers
+# ==================================================================
 
 def plot_roc_curve(labels, probs, fold_name):
     fpr, tpr, _ = roc_curve(labels, probs)
@@ -707,7 +749,9 @@ def plot_training_curves(train_losses, val_losses, train_aucs, val_aucs, fold_na
     return buf.read()
 
 
+# ==================================================================
 #  8.  Main Training Loop
+# ==================================================================
 
 def run_training(
     dataset: ZarrPatchDataset,
@@ -726,7 +770,7 @@ def run_training(
     # Note: outlier patients are already removed in main() BEFORE
     # the intensity pre-scan, so dataset.patches is already clean.
 
-    # Build group arrays for GroupKFold
+    # ── Build group arrays for GroupKFold ──────────────────────
     patient_ids_all = [p.patient_id for p in dataset.patches]
     labels_all      = [p.label for p in dataset.patches]
     groups = np.array(patient_ids_all)
@@ -737,7 +781,7 @@ def run_training(
     logger.info("GroupKFold: %d patches, %d unique patients, region=%s",
                 len(dataset.patches), len(unique_pids), region)
 
-    # Region integrity check
+    # ── Region integrity check ──────────────────────────────────
     # Verify that ALL patches in the dataset belong to the expected
     # region. If patches from other regions leaked in (e.g. from a
     # corrupted index), log a CRITICAL warning.
@@ -756,9 +800,14 @@ def run_training(
     else:
         logger.info("Region integrity OK: all patches belong to '%s'", region)
 
-    gkf = GroupKFold(n_splits=5)
+    # Group-STRATIFIED K-fold with shuffling: plain GroupKFold is
+    # deterministic, so repeating it under different seeds would reproduce
+    # the identical partition. Stratifying also prevents degenerate folds
+    # such as the 4-PD / 1-HC putamen fold of the previous run.
+    gkf = StratifiedGroupKFold(
+        n_splits=5, shuffle=True, random_state=int(_params["seed"]))
 
-    # Per-model collectors
+    # ── Per-model collectors ───────────────────────────────────
     all_results = {name: {
         "golden_rows": [],
         "fold_roc_data": [],
@@ -766,7 +815,9 @@ def run_training(
         "fold_summaries": [],
     } for name in ["A", "B", "C"]}
 
+    # ════════════════════════════════════════════════════════════
     #  OUTER LOOP — 5 folds
+    # ════════════════════════════════════════════════════════════
 
     for fold_idx, (train_val_idx, test_idx) in enumerate(
         gkf.split(X, y, groups)
@@ -777,12 +828,13 @@ def run_training(
                      fold_idx + 1, len(train_val_idx), len(test_idx))
         logger.info("=" * 60)
 
-        # Inner split: train_val -> train + val
+        # ── Inner split: train_val -> train + val ──────────────
         tv_groups = groups[train_val_idx]
         tv_y      = y[train_val_idx]
         tv_X      = train_val_idx  # actual indices into dataset
 
-        inner_gkf = GroupKFold(n_splits=4)
+        inner_gkf = StratifiedGroupKFold(
+            n_splits=4, shuffle=True, random_state=int(_params["seed"]))
         inner_splits = list(inner_gkf.split(tv_X, tv_y, tv_groups))
         train_idx_rel, val_idx_rel = inner_splits[0]
         train_idx = tv_X[train_idx_rel]
@@ -792,11 +844,46 @@ def run_training(
         train_pids = sorted(set(groups[train_idx]))
         val_pids   = sorted(set(groups[val_idx]))
         test_pids  = sorted(set(groups[test_idx]))
-        logger.info("  Train patients: %s", train_pids)
+        logger.info("  Donors -- train=%d val=%d test=%d | "
+                    "test PD=%d HC=%d",
+                    len(train_pids), len(val_pids), len(test_pids),
+                    sum(1 for p in test_pids if str(p).startswith("PD")),
+                    sum(1 for p in test_pids if str(p).startswith("HC")))
+        logger.info("  Train patients: %s", [str(p) for p in train_pids])
         logger.info("  Val   patients: %s", val_pids)
         logger.info("  Test  patients: %s", test_pids)
 
-        # Create DataLoaders
+        # ── Fold-restricted intensity normalisation ────────────
+        # The cohort target and the Spearman bias screen are re-estimated
+        # from THIS fold's TRAINING donors only, then applied unchanged to
+        # the validation and test donors. Per-donor statistics are derived
+        # from each donor's own data and carry no label information.
+        _train_only_stats = {
+            pid: st for pid, st in _GLOBAL_PATIENT_STATS.items()
+            if pid in set(train_pids)
+        }
+        if not _train_only_stats:
+            raise RuntimeError(f"{fold_name}: no training-donor intensity stats")
+
+        _fold_target_stats = compute_target_stats(_train_only_stats)
+        _fold_spearman = run_spearman_bias_test(_train_only_stats, alpha=0.05)
+        for _sr in _fold_spearman:
+            logger.info("  [%s] Spearman (train donors only) [%s]: rho=%.4f p=%.4f %s",
+                        fold_name, _sr.channel_name, _sr.rho, _sr.p_value,
+                        "BIAS" if _sr.significant else "OK")
+
+        dataset._normalizer = IntensityNormalizer(
+            patient_stats=_GLOBAL_PATIENT_STATS,   # per-donor, own data only
+            target_stats=_fold_target_stats,       # TRAIN donors of this fold only
+            model_type="C",
+            use_patient_percentiles=True,
+            apply_cross_patient_alignment=True,
+            force_alignment=True,
+        )
+        logger.info("  [%s] normalisation target refit on %d training donors",
+                    fold_name, len(_train_only_stats))
+
+        # ── Create DataLoaders ─────────────────────────────────
         train_ds = Subset(dataset, train_idx.tolist())
         val_ds   = Subset(dataset, val_idx.tolist())
         test_ds  = Subset(dataset, test_idx.tolist())
@@ -817,7 +904,7 @@ def run_training(
             pin_memory=True,
         )
 
-        # Create 3 models with BN calibration
+        # ── Create 3 models with BN calibration ──────────────
         # Each model gets a calibration pass on the TRAIN split
         # to re-compute BN running stats on microscopy data.
         # This replaces the ImageNet running stats that are INVALID
@@ -840,7 +927,7 @@ def run_training(
             ).to(DEVICE),
         }
 
-        # Loss function
+        # ── Loss function ─────────────────────────────────────
         train_labels_list = [dataset.patches[i].label for i in train_idx]
         counts = np.bincount(train_labels_list, minlength=2).astype(np.float64)
         total = counts.sum()
@@ -855,7 +942,7 @@ def run_training(
             label_smoothing=_params["label_smoothing"],
         )
 
-        # Optimizer (all trainable params from all models)
+        # ── Optimizer (all trainable params from all models) ───
         trainable_params = []
         for model in models.values():
             trainable_params.extend(
@@ -866,7 +953,7 @@ def run_training(
             lr=_params["lr"],
             weight_decay=_params["weight_decay"],
         )
-        # Scheduler: Linear warmup + CosineAnnealingLR
+        # ── Scheduler: Linear warmup + CosineAnnealingLR ───────
         warmup_epochs = _params["warmup_epochs"]
         total_epochs  = _params["max_epochs"]
         cosine_epochs = total_epochs - warmup_epochs
@@ -908,9 +995,10 @@ def run_training(
             logger.info("Scheduler: LinearLR only (warmup=%d >= max_epochs=%d)",
                         warmup_epochs, total_epochs)
 
-        # Training loop
+        # ── Training loop ─────────────────────────────────────
         best_val_auc = {name: 0.0 for name in models}
         best_models  = {name: None for name in models}
+        best_epoch   = {name: 0 for name in models}
         patience_ctr = {name: 0 for name in models}
         all_train_losses = {name: [] for name in models}
         all_val_losses   = {name: [] for name in models}
@@ -918,17 +1006,17 @@ def run_training(
         all_val_aucs     = {name: [] for name in models}
 
         for epoch in range(1, _params["max_epochs"] + 1):
-            # Train
+            # ── Train ──────────────────────────────────────────
             train_results = train_one_epoch(
                 models, train_loader, criterion, optimizer, DEVICE, dataset,
             )
 
-            # Validate
+            # ── Validate ───────────────────────────────────────
             val_results = evaluate(
                 models, val_loader, criterion, DEVICE, dataset,
             )
 
-            # Compute patient-level val AUC per model
+            # ── Compute patient-level val AUC per model ────────
             val_patient_aucs = {}
             for name in models:
                 _, _, v_auc, v_probs, v_labels = val_results[name]
@@ -946,7 +1034,7 @@ def run_training(
                 else:
                     val_patient_aucs[name] = 0.0
 
-            # Log to ClearML
+            # ── Log to ClearML ─────────────────────────────────
             for name in models:
                 t_loss, t_acc, t_auc = train_results[name]
                 v_loss, v_acc, v_auc = val_results[name][0], val_results[name][1], val_results[name][2]
@@ -962,16 +1050,29 @@ def run_training(
                     f"{name}/Patient_AUC", "val",
                     value=val_patient_aucs[name], iteration=epoch)
 
-            # Scheduler step
+            # ── Scheduler step ────────────────────────────────
             scheduler.step()
             current_lr = optimizer.param_groups[0]["lr"]
 
-            # Best model tracking per model
+            # ── Best model tracking per model ──────────────────
+            # Selection uses PATCH-level validation AUC. The donor-level AUC
+            # is computed from only ~4 validation donors, so it takes 5 discrete
+            # values, saturates at 1.000 within the first epochs and freezes the
+            # checkpoint on an untrained network. All *reported* metrics remain
+            # donor-level; this choice affects only which epoch is kept.
+            _warm = int(_params["warmup_epochs"])
             for name in models:
                 v_auc = val_results[name][2]
+                if epoch <= _warm:
+                    # Do not select (or penalise) during LR warmup.
+                    if best_models[name] is None:
+                        best_models[name] = copy.deepcopy(models[name].state_dict())
+                        best_epoch[name] = epoch
+                    continue
                 if v_auc > best_val_auc[name]:
                     best_val_auc[name] = v_auc
                     best_models[name] = copy.deepcopy(models[name].state_dict())
+                    best_epoch[name] = epoch
                     patience_ctr[name] = 0
                 else:
                     patience_ctr[name] += 1
@@ -986,18 +1087,21 @@ def run_training(
                 )
             )
 
-            # Early stopping (all models exhausted patience)
+            # ── Early stopping (all models exhausted patience) ──
             if all(patience_ctr[n] >= _params["patience"] for n in models):
+                for _n in models:
+                    logger.info("  selected epoch for %s: %d (val patch AUC=%.4f)",
+                                _n, best_epoch[_n], best_val_auc[_n])
                 logger.info("Early stopping: all models exceeded patience=%d",
                             _params["patience"])
                 break
 
-        # Load best models
+        # ── Load best models ───────────────────────────────────
         for name in models:
             if best_models[name] is not None:
                 models[name].load_state_dict(best_models[name])
 
-        # Upload training curves per model
+        # ── Upload training curves per model ───────────────────
         for name in models:
             tc_png = plot_training_curves(
                 all_train_losses[name], all_val_losses[name],
@@ -1011,7 +1115,7 @@ def run_training(
                 iteration=fold_idx,
             )
 
-        # Upload best model weights per model
+        # ── Upload best model weights per model ────────────────
         for name in models:
             if best_models[name] is not None:
                 buf = io.BytesIO()
@@ -1021,7 +1125,7 @@ def run_training(
                                       f"best_model_{name}_fold_{fold_idx}.pth")
                 upload_bytes_to_minio(buf.read(), ckpt_key, fs)
 
-        # Test evaluation
+        # ── Test evaluation ────────────────────────────────────
         test_results = evaluate(models, test_loader, criterion, DEVICE, dataset)
 
         for name in models:
@@ -1034,7 +1138,7 @@ def run_training(
                 t_probs, t_labels, test_pids_list,
             )
 
-            # ROC curve
+            # ── ROC curve ──────────────────────────────────────
             if len(t_probs) > 0 and len(set(t_labels)) > 1:
                 roc_png = plot_roc_curve(t_labels, t_probs, f"{name}_{fold_name}")
                 roc_key = minio_path(name, region, "figures",
@@ -1049,7 +1153,7 @@ def run_training(
                     "probs": t_probs,
                 })
 
-            # Confusion matrix
+            # ── Confusion matrix ───────────────────────────────
             if len(t_probs) > 0:
                 preds = (np.array(t_probs) >= 0.5).astype(int).tolist()
                 cm_png = plot_confusion_matrix(t_labels, preds, f"{name}_{fold_name}")
@@ -1060,7 +1164,7 @@ def run_training(
                     clearml_task, f"{name}/CM", f"fold_{fold_idx}", cm_png,
                 )
 
-            # Golden CSV rows (patch-level)
+            # ── Golden CSV rows (patch-level) ──────────────────
             for i in range(len(t_probs)):
                 p = dataset.patches[test_idx[i]]
                 all_results[name]["golden_rows"].append({
@@ -1074,7 +1178,7 @@ def run_training(
                     "Fold": fold_idx,
                 })
 
-            # Patient-level rows
+            # ── Patient-level rows ─────────────────────────────
             for pid, details in patient_details.items():
                 # Use actual patch region (not _params), to detect
                 # any region leakage bugs in the data
@@ -1090,7 +1194,7 @@ def run_training(
                     "Model": name,
                 })
 
-            # Fold summary
+            # ── Fold summary ───────────────────────────────────
             fold_summary = {
                 "fold": fold_idx,
                 "model": name,
@@ -1104,7 +1208,7 @@ def run_training(
             }
             all_results[name]["fold_summaries"].append(fold_summary)
 
-            # Upload fold predictions immediately
+            # ── Upload fold predictions immediately ────────────
             if len(all_results[name]["golden_rows"]) > 0:
                 df_golden = pd.DataFrame(all_results[name]["golden_rows"])
                 golden_key = minio_path(name, region, "predictions",
@@ -1117,7 +1221,7 @@ def run_training(
                                          f"patient_predictions_{name}.csv")
                 upload_df_to_minio(df_patient, patient_key, fs)
 
-            # Log to ClearML
+            # ── Log to ClearML ─────────────────────────────────
             logger.info(
                 "TEST %s %s -- loss=%.4f patch_auc=%.4f "
                 "patient_auc=%.4f n_patients=%d",
@@ -1129,16 +1233,18 @@ def run_training(
                 value=patient_auc_val, iteration=fold_idx,
             )
 
-        # Free GPU memory
+        # ── Free GPU memory ────────────────────────────────────
         del models, optimizer, scheduler, criterion
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+    # ════════════════════════════════════════════════════════════
     #  POST-PROCESSING: aggregated results per model
+    # ════════════════════════════════════════════════════════════
 
     for name in ["A", "B", "C"]:
         r = all_results[name]
 
-        # Overlay ROC curves
+        # ── Overlay ROC curves ─────────────────────────────────
         if len(r["fold_roc_data"]) > 1:
             overlay_png = plot_roc_overlay(r["fold_roc_data"])
             overlay_key = minio_path(name, region, "figures",
@@ -1148,14 +1254,14 @@ def run_training(
                 clearml_task, f"{name}/ROC", "overlay", overlay_png,
             )
 
-        # Fold summary CSV
+        # ── Fold summary CSV ───────────────────────────────────
         if len(r["fold_summaries"]) > 0:
             df_summary = pd.DataFrame(r["fold_summaries"])
             summary_key = minio_path(name, region, "predictions",
                                      f"fold_summary_{name}.csv")
             upload_df_to_minio(df_summary, summary_key, fs)
 
-            # Compute and log mean AUC
+            # ── Compute and log mean AUC ───────────────────────
             mean_patch_auc   = df_summary["test_patch_auc"].mean()
             std_patch_auc    = df_summary["test_patch_auc"].std()
             mean_patient_auc = df_summary["test_patient_auc"].mean()
@@ -1175,15 +1281,35 @@ def run_training(
     logger.info("Training complete for region=%s", region)
 
 
+# ==================================================================
 #  9.  Entry point
+# ==================================================================
 
 def main() -> None:
-    seed_everything(_params["seed"])
+    regions = [r.strip() for r in str(_params["regions"]).split(",") if r.strip()]
+    seeds = [int(x) for x in str(_params["seeds"]).split(",") if str(x).strip()]
+    logger.info("=" * 70)
+    logger.info("V3 SINGLE TASK: regions=%s x seeds=%s  (%d training runs)",
+                regions, seeds, len(regions) * len(seeds))
+    logger.info("Data are downloaded, preloaded and pre-scanned ONCE per region.")
+    logger.info("=" * 70)
 
-    region = _params["region"]
-    logger.info("Starting unified training: region=%s", region)
+    for _region_i, region in enumerate(regions, 1):
+        logger.info("#" * 70)
+        logger.info("# REGION %d/%d: %s", _region_i, len(regions), region)
+        logger.info("#" * 70)
+        _params["region"] = region
+        _run_region(region, seeds)
+        gc.collect()
 
-    # Download patch index from MinIO
+    logger.info("ALL REGIONS AND SEEDS COMPLETE")
+
+
+def _run_region(region: str, seeds: list) -> None:
+    seed_everything(seeds[0])
+    logger.info("Preparing data for region=%s (once for %d seeds)", region, len(seeds))
+
+    # ── Download patch index from MinIO ────────────────────────
     if not os.path.exists(LOCAL_INDEX_PATH):
         logger.info("Downloading patch index from MinIO …")
         try:
@@ -1199,13 +1325,13 @@ def main() -> None:
         except Exception as exc:
             logger.warning("Failed to download index: %s", exc)
 
-    # Create dataset (model_type="C" loads both channels)
+    # ── Create dataset (model_type="C" loads both channels) ────
     dataset = ZarrPatchDataset(
         minio_endpoint=MINIO_ENDPOINT,
         minio_access_key=MINIO_ACCESS,
         minio_secret_key=MINIO_SECRET,
-        storage_name=MINIO_STORAGE_NAME,
-        base_prefix=MINIO_BASE,
+        bucket_name=MINIO_BUCKET,
+        base_folder=MINIO_BASE,
         model_type="C",                   # load BOTH channels
         patch_size=_params["patch_size"],
         target_z=_params["target_z"],
@@ -1215,7 +1341,7 @@ def main() -> None:
         groups=["HC", "PD"],              # ALL patients
         filter_empty=_params["filter_empty"],
         index_path=LOCAL_INDEX_PATH,
-        cache_dir=_params["cache_dir"],
+        local_cache_dir=_params["local_cache_dir"],
         preload_to_ram=_params["preload_to_ram"],
         normalization=_params["normalization"],
         augment=False,
@@ -1226,13 +1352,13 @@ def main() -> None:
                 len(set(p.patient_id for p in dataset.patches)),
                 region)
 
-    # Preload data to RAM
+    # ── Preload data to RAM ────────────────────────────────────
     dataset.preload_data(
         max_workers=_params["max_workers"],
         max_ram_gb=_params["max_ram_gb"],
     )
 
-    # Remove outlier patients BEFORE pre-scan
+    # ── Remove outlier patients BEFORE pre-scan ───────────────
     # CRITICAL: outlier patients must be removed before computing
     # intensity statistics, otherwise the target stats are biased
     # by the outlier patients and the normalizer is calibrated to
@@ -1254,7 +1380,7 @@ def main() -> None:
     else:
         logger.warning("No patches removed -- outlier patients not found!")
 
-    # Intensity normalization pre-scan
+    # ── Intensity normalization pre-scan ───────────────────────
     # Now runs on CLEAN data (without outliers)
     logger.info("Running intensity pre-scan ...")
     patient_stats, target_stats, spearman_results = run_full_pre_scan(
@@ -1264,10 +1390,17 @@ def main() -> None:
         seed=_params["seed"],
     )
 
-    # Create and set IntensityNormalizer
+    # Per-donor statistics are computed from each donor's own patches and
+    # contain no label information; they are reused across folds. The cohort
+    # TARGET is NOT used globally here -- run_training() re-estimates it from
+    # each outer fold's training donors (see the fold loop).
+    global _GLOBAL_PATIENT_STATS
+    _GLOBAL_PATIENT_STATS = patient_stats
+
+    # ── Create and set IntensityNormalizer ─────────────────────
     normalizer = IntensityNormalizer(
         patient_stats=patient_stats,
-        target_stats=target_stats,
+        target_stats=target_stats,   # placeholder; overwritten per fold
         model_type="C",  # both channels
         use_patient_percentiles=True,
         apply_cross_patient_alignment=True,
@@ -1275,24 +1408,46 @@ def main() -> None:
     )
     dataset._normalizer = normalizer
 
-    # Save pre-scan stats to MinIO
+    # ── Save pre-scan stats to MinIO ──────────────────────────
     fs = _make_s3fs(MINIO_ENDPOINT, MINIO_ACCESS, MINIO_SECRET)
 
     stats_json_path = "/tmp/intensity_stats.json"
     save_stats_to_json(patient_stats, target_stats, spearman_results, stats_json_path)
-    stats_key = f"{MINIO_OUTPUT_PREFIX}/_system/intensity_stats_{region}.json"
+    stats_key = f"{MINIO_RESULTS_ROOT}_v2/_system/intensity_stats_{region}.json"
     upload_to_minio(stats_json_path, stats_key, fs)
 
-    # Log Spearman results
+    # ── Log Spearman results ───────────────────────────────────
     for sr in spearman_results:
         logger.info("Spearman [%s]: rho=%.4f p=%.4f %s",
                      sr.channel_name, sr.rho, sr.p_value,
                      "BIAS!" if sr.significant else "OK")
 
-    # Run training
-    run_training(dataset, task)
+    # ── Run training: one pass per seed, same in-RAM dataset ───
+    for _i, _seed in enumerate(seeds, 1):
+        logger.info("=" * 70)
+        logger.info("REGION %s | SEED %d  (run %d/%d)", region, _seed, _i, len(seeds))
+        logger.info("Reusing the preloaded dataset and per-donor intensity stats.")
+        logger.info("=" * 70)
+        _params["seed"] = _seed
+        seed_everything(_seed)
+        try:
+            run_training(dataset, task)
+        except Exception:
+            logger.exception("Run failed for region=%s seed=%d -- continuing",
+                             region, _seed)
+        gc.collect()
 
-    logger.info("All done!")
+    # Free RAM before the next region is preloaded.
+    try:
+        dataset._raw_cache.clear()
+        dataset._zarr_cache.clear()
+        dataset._is_preloaded = False
+        logger.info("Freed RAM cache for region %s", region)
+    except Exception as _exc:
+        logger.warning("Could not clear RAM cache: %s", _exc)
+    del dataset
+    gc.collect()
+    logger.info("Region %s complete", region)
 
 
 if __name__ == "__main__":

@@ -1,27 +1,33 @@
+#!/usr/bin/env python3
 """
 Production 3D Connected Component Analysis  --  ClearML Pipeline
+=================================================================
 
 Runs 3D connected-component labelling on ALL binary masks across the
 entire cohort (Putamen + SN, HC + PD), and uploads results to MinIO.
 
-Configured object-store layout
+MinIO data layout
+-----------------
     YOUR_BASE_PREFIX/{HC|PD}/{region}/{patient}/
         Patient_ImageStack_0000.ome.zarr/
         Patient_ImageStack_0001.ome.zarr/
         ...
 
 Windows compatibility
+---------------------
 On Windows the fsspecIO daemon thread crashes with socket errors
 (WinError 10038) when zarr reads directly from an S3-backed store.
 This script downloads each zarr store to a local temp directory before
 opening it, which avoids the async I/O issues entirely.
 
 ClearML integration
-* Project : YOUR_CLEARML_PROJECT
+-------------------
+* Project : SPP_training
 * Queue   : default
-* Results : uploaded to the the configured storage backend
+* Results : uploaded to ``YOUR_STORAGE_NAME/spp-results/`` on MinIO
 
 Output artifacts (per patient/FOV)
+----------------------------------
 For each processed FOV, a JSON file is written containing:
 
   Identifiers:
@@ -52,6 +58,7 @@ For each processed FOV, a JSON file is written containing:
 A single **summary CSV** aggregating all FOVs is also produced.
 
 Usage
+-----
     # Run locally (for debugging):
     CLEARML_DISABLED=true python cc3d_production.py
 
@@ -78,13 +85,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Apply the Windows asyncio/SSL workaround before importing s3fs or aiohttp.
+# ---------------------------------------------------------------------------
+# Windows asyncio / SSL fix  --  MUST be before s3fs/aiohttp import
+# ---------------------------------------------------------------------------
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
 # MinIO env vars (same as zarr_patch_dataset.py)
+# ---------------------------------------------------------------------------
 os.environ["AWS_ACCESS_KEY_ID"] = "YOUR_MINIO_ACCESS_KEY"
 os.environ["AWS_SECRET_ACCESS_KEY"] = "YOUR_MINIO_SECRET_KEY"
 os.environ["AWS_ENDPOINT_URL"] = "YOUR_MINIO_ENDPOINT"
@@ -95,9 +106,11 @@ import s3fs
 import zarr
 from skimage.measure import label, regionprops
 
-# Inline cc3d_utils so the script stays self-contained.
+# ===================================================================
+# INLINE: cc3d_utils  (self-contained — no external module dependency)
+# ===================================================================
 
-# Physical resolution constants for confocal microscopy; Z spacing is coarser than Y/X.
+# Physical resolution constants  (confocal microscopy, Z much coarser)
 RESOLUTION_UM = np.array([0.5, 0.11, 0.11], dtype=np.float64)  # (Z, Y, X)
 
 
@@ -228,7 +241,9 @@ def process_zarr_masks(
         results[mask_name] = result
     return results
 
+# ===================================================================
 # END INLINE cc3d_utils
+# ===================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -236,7 +251,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
 # Constants
+# ---------------------------------------------------------------------------
 MINIO_ENDPOINT = os.environ.get(
     "MINIO_ENDPOINT", "YOUR_MINIO_ENDPOINT"
 )
@@ -246,12 +263,12 @@ MINIO_ACCESS_KEY = os.environ.get(
 MINIO_SECRET_KEY = os.environ.get(
     "MINIO_SECRET_KEY", "YOUR_MINIO_SECRET_KEY"
 )
-STORAGE_NAME = "YOUR_STORAGE_NAME"
-BASE_PREFIX = "YOUR_BASE_PREFIX"
-OUTPUT_PREFIX = "YOUR_OUTPUT_PREFIX/cc3d_analysis"
+BUCKET = "YOUR_STORAGE_NAME"
+BASE_FOLDER = "YOUR_BASE_PREFIX"
+RESULTS_PREFIX = "spp-results/cc3d_analysis"
 
 # Local temp directory for downloading zarr stores
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "YOUR_LOCAL_CACHE_DIR")
+LOCAL_CACHE_DIR = os.path.join(tempfile.gettempdir(), "cc3d_zarr_cache")
 
 # Cohort definition
 REGIONS = ["putamen", "substantiaNigra"]
@@ -272,7 +289,9 @@ MISSING_FOVS = {
 _FOV_RE = re.compile(r"Patient_ImageStack_(\d+)\.ome\.zarr", re.IGNORECASE)
 
 
+# ---------------------------------------------------------------------------
 # MinIO helpers
+# ---------------------------------------------------------------------------
 
 def _make_s3fs() -> s3fs.S3FileSystem:
     """Create an s3fs filesystem for MinIO."""
@@ -329,7 +348,7 @@ def _download_zarr_locally(fs: s3fs.S3FileSystem, zarr_key: str) -> str:
     Returns the local path to the downloaded zarr directory.
     """
     local_name = zarr_key.replace("/", "_")
-    local_path = os.path.join(CACHE_DIR, local_name)
+    local_path = os.path.join(LOCAL_CACHE_DIR, local_name)
 
     # Check if already cached and valid
     if os.path.isdir(local_path):
@@ -345,9 +364,9 @@ def _download_zarr_locally(fs: s3fs.S3FileSystem, zarr_key: str) -> str:
             logger.warning("Corrupt cache at %s — re-downloading.", local_path)
             shutil.rmtree(local_path, ignore_errors=True)
 
-    s3_path = f"{STORAGE_NAME}/{zarr_key}"
+    s3_path = f"{BUCKET}/{zarr_key}"
     logger.info("Downloading zarr: %s -> %s", s3_path, local_path)
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 
     try:
         _retry_s3(fs.get, s3_path, local_path, recursive=True)
@@ -368,11 +387,13 @@ def _is_zarr_store(fs: s3fs.S3FileSystem, s3_path: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
 # Discovery: find all zarr stores across the cohort
+# ---------------------------------------------------------------------------
 
 def discover_all_stores(fs: s3fs.S3FileSystem) -> List[Dict[str, str]]:
     """
-    Walk the MinIO storage and discover all zarr stores for all
+    Walk the MinIO bucket and discover all zarr stores for all
     patients, regions, and FOVs.
 
     Actual layout on MinIO:
@@ -384,22 +405,22 @@ def discover_all_stores(fs: s3fs.S3FileSystem) -> List[Dict[str, str]]:
     Returns a list of dicts, each with keys:
         zarr_key, group, region, patient_id, fov_id
     """
-    prefix = BASE_PREFIX + "/"
+    prefix = BASE_FOLDER + "/"
     stores: List[Dict[str, str]] = []
 
     for grp in GROUPS:
         for reg in REGIONS:
             folder_prefix = f"{prefix}{grp}/{reg}/"
-            storage_prefix = f"{STORAGE_NAME}/{folder_prefix}"
+            bucket_prefix = f"{BUCKET}/{folder_prefix}"
 
             try:
-                patient_entries = fs.ls(storage_prefix, detail=False)
+                patient_entries = fs.ls(bucket_prefix, detail=False)
             except FileNotFoundError:
                 logger.warning("Folder not found: %s", folder_prefix)
                 continue
 
             for pe in patient_entries:
-                rel = pe.removeprefix(STORAGE_NAME + "/").rstrip("/")
+                rel = pe.removeprefix(BUCKET + "/").rstrip("/")
                 entry_name = rel.replace(folder_prefix.rstrip("/"), "").strip("/")
                 if not entry_name or entry_name.startswith("."):
                     continue
@@ -412,7 +433,7 @@ def discover_all_stores(fs: s3fs.S3FileSystem) -> List[Dict[str, str]]:
                     logger.info("Skipping missing patient: %s / %s", reg, patient_id)
                     continue
 
-                s3_path = f"{STORAGE_NAME}/{rel}"
+                s3_path = f"{BUCKET}/{rel}"
 
                 # Check if this IS a zarr store itself (unlikely, but handle)
                 if _is_zarr_store(fs, s3_path):
@@ -432,7 +453,7 @@ def discover_all_stores(fs: s3fs.S3FileSystem) -> List[Dict[str, str]]:
                     continue
 
                 for fe in fov_entries:
-                    fov_rel = fe.removeprefix(STORAGE_NAME + "/").rstrip("/")
+                    fov_rel = fe.removeprefix(BUCKET + "/").rstrip("/")
                     fov_name = fov_rel.replace(rel + "/", "").strip("/")
                     if not fov_name or fov_name.startswith("."):
                         continue
@@ -469,7 +490,9 @@ def discover_all_stores(fs: s3fs.S3FileSystem) -> List[Dict[str, str]]:
     return stores
 
 
+# ---------------------------------------------------------------------------
 # Process a single zarr store (FOV)
+# ---------------------------------------------------------------------------
 
 def process_single_fov(
     fs: s3fs.S3FileSystem,
@@ -480,11 +503,13 @@ def process_single_fov(
     return results dict.
 
     Parameters
+    ----------
     fs : s3fs.S3FileSystem
     store_info : dict
         Must contain: zarr_key, group, region, patient_id, fov_id
 
     Returns
+    -------
     dict | None
         Results dict with keys: patient_id, group, region, fov_id,
         cell_mask, protein_mask, n_cells, n_proteins
@@ -512,7 +537,9 @@ def process_single_fov(
     # Each Patient_ImageStack_XXXX.ome.zarr IS the FOV root directly
     fov_root = root
 
+    # ------------------------------------------------------------------
     # Read mask shapes for FOV window bounds (needed for SPP edge correction)
+    # ------------------------------------------------------------------
     mask_shape = None
     for mask_name_try in ["cell_mask", "protein_mask"]:
         try:
@@ -571,8 +598,11 @@ def process_single_fov(
             result[mask_name] = []
             result[f"n_{mask_name.replace('_mask', '')}s"] = 0
 
+    # ------------------------------------------------------------------
     # SPP-ready structure: explicit points + marks for Spatial Point
-    # Store the analysis results as explicit points and marks.
+    # Process analysis.  This makes it trivial to load into a marked
+    # point pattern object (e.g. spatstat-like Python equivalents).
+    # ------------------------------------------------------------------
     spp_data: Dict[str, Any] = {}
 
     for mask_name, point_type in [("cell_mask", "type_I_cell"),
@@ -609,7 +639,9 @@ def process_single_fov(
         if mask_name in cc_results:
             cc_results[mask_name].pop("label_image", None)
 
+    # ------------------------------------------------------------------
     # Delete local zarr copy to free disk space (each zarr ~200-400 MB)
+    # ------------------------------------------------------------------
     try:
         if os.path.isdir(local_path):
             shutil.rmtree(local_path, ignore_errors=True)
@@ -620,7 +652,9 @@ def process_single_fov(
     return result
 
 
+# ---------------------------------------------------------------------------
 # Upload results to MinIO
+# ---------------------------------------------------------------------------
 
 def _convert_numpy(obj):
     """Recursively convert numpy types to native Python for JSON serialization."""
@@ -650,13 +684,13 @@ def upload_results_to_minio(
     Upload all per-FOV JSON results and the summary CSV to MinIO.
 
     MinIO layout:
-        YOUR_OUTPUT_PREFIX/cc3d_analysis/
+        spp-results/cc3d_analysis/
             {group}/{region}/{patient_id}/{fov_id}.json
             summary.csv
     """
     for r in results:
         json_key = (
-            f"{STORAGE_NAME}/{OUTPUT_PREFIX}/"
+            f"{BUCKET}/{RESULTS_PREFIX}/"
             f"{r['group']}/{r['region']}/{r['patient_id']}/{r['fov_id']}.json"
         )
         # Convert numpy types to native Python before JSON serialization
@@ -672,7 +706,7 @@ def upload_results_to_minio(
             )
 
     # Upload summary CSV
-    csv_key = f"{STORAGE_NAME}/{OUTPUT_PREFIX}/summary.csv"
+    csv_key = f"{BUCKET}/{RESULTS_PREFIX}/summary.csv"
     try:
         _retry_s3(fs.put, summary_csv_path, csv_key, max_retries=3)
         logger.info("Uploaded summary CSV to %s", csv_key)
@@ -685,7 +719,9 @@ def upload_results_to_minio(
     )
 
 
+# ---------------------------------------------------------------------------
 # Write summary CSV
+# ---------------------------------------------------------------------------
 
 def write_summary_csv(
     results: List[Dict[str, Any]],
@@ -738,7 +774,9 @@ def write_summary_csv(
     logger.info("Summary CSV written to %s (%d rows)", csv_path, len(rows))
 
 
+# ---------------------------------------------------------------------------
 # Main pipeline
+# ---------------------------------------------------------------------------
 
 def run_pipeline() -> None:
     """Run the full 3D CCL pipeline across the entire cohort."""
@@ -746,7 +784,9 @@ def run_pipeline() -> None:
 
     fs = _make_s3fs()
 
+    # ------------------------------------------------------------------
     # Step 1: Discover all zarr stores
+    # ------------------------------------------------------------------
     logger.info("Step 1: Discovering all zarr stores ...")
     stores = discover_all_stores(fs)
     logger.info("Found %d FOV zarr stores to process.", len(stores))
@@ -755,7 +795,9 @@ def run_pipeline() -> None:
         logger.error("No stores found. Aborting.")
         return
 
+    # ------------------------------------------------------------------
     # Step 2: Process each FOV
+    # ------------------------------------------------------------------
     logger.info("Step 2: Running 3D CCL on all FOVs ...")
     results: List[Dict[str, Any]] = []
     failed: List[str] = []
@@ -790,6 +832,10 @@ def run_pipeline() -> None:
                 logger.info(
                     "  Processed %d/%d FOVs ...", done_count, len(stores)
                 )
+                print(
+                    f"[CC3D] Processed {done_count}/{len(stores)} FOVs ...",
+                    flush=True,
+                )
 
     logger.info(
         "Step 2 complete: %d FOVs processed, %d failed.",
@@ -798,12 +844,16 @@ def run_pipeline() -> None:
     if failed:
         logger.warning("Failed stores: %s", failed[:20])
 
+    # ------------------------------------------------------------------
     # Step 3: Write summary CSV
-    csv_path = os.path.join(CACHE_DIR, "cc3d_summary.csv")
+    # ------------------------------------------------------------------
+    csv_path = os.path.join(LOCAL_CACHE_DIR, "cc3d_summary.csv")
     logger.info("Step 3: Writing summary CSV ...")
     write_summary_csv(results, csv_path)
 
+    # ------------------------------------------------------------------
     # Step 4: Upload results to MinIO
+    # ------------------------------------------------------------------
     logger.info("Step 4: Uploading results to MinIO ...")
     upload_results_to_minio(fs, results, csv_path)
 
@@ -812,8 +862,15 @@ def run_pipeline() -> None:
         "Pipeline complete! Processed %d FOVs in %.1f seconds.",
         len(results), elapsed,
     )
+    print(
+        f"\n[DONE] Processed {len(results)} FOVs in {elapsed:.0f}s. "
+        f"Results uploaded to MinIO at {RESULTS_PREFIX}/",
+        flush=True,
+    )
 
+    # ------------------------------------------------------------------
     # Aggregate statistics (for ClearML logging)
+    # ------------------------------------------------------------------
     total_cells = sum(r.get("n_cells", 0) for r in results)
     total_proteins = sum(r.get("n_proteins", 0) for r in results)
     logger.info(
@@ -842,12 +899,14 @@ def run_pipeline() -> None:
         )
 
     # Optional: clean up local cache to free disk space
-    if os.path.isdir(CACHE_DIR):
-        logger.info("Cleaning up local cache: %s", CACHE_DIR)
-        shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    if os.path.isdir(LOCAL_CACHE_DIR):
+        logger.info("Cleaning up local cache: %s", LOCAL_CACHE_DIR)
+        shutil.rmtree(LOCAL_CACHE_DIR, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
 # ClearML entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     # Check if ClearML is disabled (for local testing without ClearML)
@@ -860,13 +919,13 @@ if __name__ == "__main__":
 
         # NOTE: do NOT add scikit-image here — ClearML auto-detects it
         # from the `from skimage.measure import ...` import. Adding it
-        # manually creates a duplicate requirement (scikit_image X.Y.Z
+        # manually creates a duplicate requirement (scikit_image==X.Y.Z
         # + scikit-image) which crashes pip install.
         Task.add_requirements("boto3")
         Task.add_requirements("s3fs")
 
         task = Task.init(
-            project_name="YOUR_CLEARML_PROJECT",
+            project_name="SPP_training",
             task_name="CC3D_Analysis_Pipeline",
             task_type=Task.TaskTypes.data_processing,
         )

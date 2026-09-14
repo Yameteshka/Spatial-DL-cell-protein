@@ -1,15 +1,18 @@
 """
 OME-Zarr 2.75D Patch Dataset for Microglia Analysis
+====================================================
 
 PyTorch Dataset for extracting 2.75D patches from OME-Zarr stores
 hosted in MinIO (S3-compatible) object storage.
 
 Architecture variants
+---------------------
     Model A (IBA1 only):  output shape  (1, 25, 256, 256)
     Model B (pSyn only):  output shape  (1, 25, 256, 256)
     Model C (both):       output shape  (2, 25, 256, 256)
 
 Key features
+------------
 * Z-padding with zeros when the native Z depth < target_z slices.
 * Empty-patch detection via **binary masks** from ``root['labels']``
   (never from raw fluorescence -- thermal noise is always > 0).
@@ -27,13 +30,15 @@ Key features
   before tensor conversion.
 
 OME-Zarr internal layout (per FOV)
+-----------------------------------
     root['0'][0]                               -> pSyn  raw fluorescence (C=0)
     root['0'][1]                               -> IBA1  raw fluorescence (C=1)
     root['labels']['protein_mask']['0']         -> pSyn  binary mask
     root['labels']['cell_mask']['0']            -> IBA1  binary mask
 
-Configured object-store layout
-    {base_prefix}/
+MinIO folder layout
+-------------------
+    {base_folder}/
         HC/
             putamen/         HC1.zarr/  HC2.zarr/  ...
             substantiaNigra/ HC1.zarr/  HC2.zarr/  ...
@@ -70,7 +75,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-# Retry decorator for S3 operations
+# -- Retry decorator for S3 operations --
 def _retry_s3(fn, *args, max_retries: int = 5, base_delay: float = 2.0, **kwargs):
     """
     Retry an S3 operation with exponential backoff.
@@ -79,6 +84,7 @@ def _retry_s3(fn, *args, max_retries: int = 5, base_delay: float = 2.0, **kwargs
     that commonly occur when downloading large zarr stores from MinIO.
 
     Parameters
+    ----------
     fn : callable
         The function to call (e.g. ``fs.get``).
     max_retries : int
@@ -87,9 +93,11 @@ def _retry_s3(fn, *args, max_retries: int = 5, base_delay: float = 2.0, **kwargs
         Base delay in seconds for exponential backoff (default 2.0).
 
     Returns
+    -------
     The return value of ``fn(*args, **kwargs)``.
 
     Raises
+    ------
     The last exception if all retries are exhausted.
     """
     last_exc = None
@@ -127,7 +135,7 @@ import torch
 import zarr
 from torch.utils.data import Dataset
 
-# zarr 2.x / 3.x compatibility shim
+# -- zarr 2.x / 3.x compatibility shim --
 _ZARR_MAJOR = int(getattr(zarr, "__version__", "2").split(".")[0])
 
 if _ZARR_MAJOR >= 3:
@@ -210,11 +218,11 @@ def _make_s3fs(
 
 def _open_zarr_root(
     fs: s3fs.S3FileSystem,
-    storage: str,
+    bucket: str,
     zarr_key: str,
 ) -> zarr.Group:
     """Open a remote OME-Zarr store and return the root group."""
-    s3_path = f"{storage}/{zarr_key}"
+    s3_path = f"{bucket}/{zarr_key}"
 
     if _ZARR_V3 and _RemoteStore is not None:
         store = _RemoteStore(fs=fs, path=s3_path)
@@ -271,16 +279,17 @@ class ZarrPatchDataset(Dataset):
     network I/O during training.
 
     Parameters
+    ----------
     minio_endpoint : str
         MinIO server hostname.
     minio_access_key : str
         Access key for MinIO authentication.
     minio_secret_key : str
         Secret key for MinIO authentication.
-    storage_name : str
-        Name of the S3 storage containing the data.
-    base_prefix : str
-        Prefix inside the storage where patient folders live.
+    bucket_name : str
+        Name of the S3 bucket containing the data.
+    base_folder : str
+        Prefix inside the bucket where patient folders live.
     model_type : ``"A"`` | ``"B"`` | ``"C"``
         * **A** -- IBA1 only   -> output channels = 1
         * **B** -- pSyn only   -> output channels = 1
@@ -305,8 +314,8 @@ class ZarrPatchDataset(Dataset):
         Expected Y = X size of each FOV in pixels (default 1200).
     max_fovs_per_patient : int | None
         Safety cap on the number of FOVs accepted per patient.
-    cache_dir : str | None
-        Local directory to cache downloaded zarr stores (default "YOUR_LOCAL_CACHE_DIR").
+    local_cache_dir : str | None
+        Local directory to cache downloaded zarr stores (default "/tmp/zarr_cache").
         If None, no local caching is performed (reads from S3 each time).
     preload_to_ram : bool
         If True, ``preload_data()`` will load raw arrays into RAM for
@@ -344,15 +353,17 @@ class ZarrPatchDataset(Dataset):
     # Valid normalization modes
     _VALID_NORMALIZATION = ("percentile", "zscore", "none", "intensity_pipeline")
 
+    # -----------------------------------------------------------------
     # Construction
+    # -----------------------------------------------------------------
 
     def __init__(
         self,
         minio_endpoint: str,
         minio_access_key: str,
         minio_secret_key: str,
-        storage_name: str = "YOUR_STORAGE_NAME",
-        base_prefix: str = "YOUR_BASE_PREFIX",
+        bucket_name: str = "YOUR_STORAGE_NAME",
+        base_folder: str = "YOUR_BASE_PREFIX",
         model_type: ModelType = "C",
         patch_size: int = 256,
         target_z: int = 25,
@@ -364,19 +375,19 @@ class ZarrPatchDataset(Dataset):
         secure: bool = True,
         fov_size: int = 1200,
         max_fovs_per_patient: Optional[int] = None,
-        cache_dir: Optional[str] = "YOUR_LOCAL_CACHE_DIR",
+        local_cache_dir: Optional[str] = "/tmp/zarr_cache",
         preload_to_ram: bool = True,
         normalization: str = "percentile",
         augment: bool = False,
     ) -> None:
         super().__init__()
 
-        # Store configuration.
+        # Store configuration ------------------------------------------------
         self.minio_endpoint = minio_endpoint
         self.minio_access_key = minio_access_key
         self.minio_secret_key = minio_secret_key
-        self.storage_name = storage_name
-        self.base_prefix = base_prefix.rstrip("/")
+        self.bucket_name = bucket_name
+        self.base_folder = base_folder.rstrip("/")
         self.model_type: ModelType = model_type
         self.patch_size = patch_size
         self.target_z = target_z
@@ -391,7 +402,7 @@ class ZarrPatchDataset(Dataset):
         self.n_output_channels = self._MODEL_N_CHANNELS[self.model_type]
         self._channels_to_load = self._MODEL_CHANNELS[self.model_type]
 
-        # Normalization & augmentation
+        # -- Normalization & augmentation ------------------------------------
         if normalization not in self._VALID_NORMALIZATION:
             raise ValueError(
                 f"normalization must be one of {self._VALID_NORMALIZATION}, "
@@ -400,14 +411,14 @@ class ZarrPatchDataset(Dataset):
         self.normalization: str = normalization
         self.augment: bool = augment
 
-        # Intensity pipeline normalizer (set externally)
+        # -- Intensity pipeline normalizer (set externally) ------------
         # When normalization="intensity_pipeline", this attribute must
         # be set to an IntensityNormalizer instance before training.
         # See intensity_normalization.py for details.
         self._normalizer = None
 
-        # SSD caching + RAM pre-loading
-        self._local_cache_dir = Path(cache_dir) if cache_dir else None
+        # -- SSD caching + RAM pre-loading ----------------------------------
+        self._local_cache_dir = Path(local_cache_dir) if local_cache_dir else None
         self._preload_to_ram = preload_to_ram
         self._raw_cache: Dict[Tuple[str, str], np.ndarray] = {}
         self._is_preloaded = False
@@ -416,7 +427,7 @@ class ZarrPatchDataset(Dataset):
         self._y_starts = _patch_starts(self.fov_size, self.patch_size, self.stride)
         self._x_starts = _patch_starts(self.fov_size, self.patch_size, self.stride)
 
-        # Build or load the patch index.
+        # Build or load patch index ------------------------------------------
         self.patches: List[PatchMeta] = []
         self._zarr_cache: OrderedDict[str, zarr.Group] = OrderedDict()
         self._cache_max = 64  # keep at most this many zarr roots open
@@ -444,13 +455,16 @@ class ZarrPatchDataset(Dataset):
             self.augment,
         )
 
+    # -----------------------------------------------------------------
     # Normalization
+    # -----------------------------------------------------------------
 
     def _normalize_patch(self, patch: np.ndarray, patient_id: str = "") -> np.ndarray:
         """
         Normalize a patch per-channel.
 
         Parameters
+        ----------
         patch : np.ndarray
             Raw patch of shape ``(C_out, Z, H, W)`` with float32 values.
         patient_id : str
@@ -458,6 +472,7 @@ class ZarrPatchDataset(Dataset):
             mode to look up per-patient statistics).
 
         Returns
+        -------
         np.ndarray
             Normalized patch of the same shape.  The normalization mode
             is determined by ``self.normalization``:
@@ -471,6 +486,7 @@ class ZarrPatchDataset(Dataset):
               Requires ``self._normalizer`` to be set externally.
 
         Notes
+        -----
         - Normalization is **per-channel**: for each channel ``c``, all
           spatial + Z values (i.e. ``patch[c].ravel()``) are used to
           compute the statistic.
@@ -534,7 +550,9 @@ class ZarrPatchDataset(Dataset):
 
         return out
 
+    # -----------------------------------------------------------------
     # Augmentation
+    # -----------------------------------------------------------------
 
     def _augment_patch(self, patch: np.ndarray) -> np.ndarray:
         """
@@ -557,15 +575,18 @@ class ZarrPatchDataset(Dataset):
         - Random erasing (5-15% of spatial area, 20% chance)
 
         Parameters
+        ----------
         patch : np.ndarray
             Patch of shape ``(C_out, Z, H, W)`` with values in [0, 1]
             (after normalization).
 
         Returns
+        -------
         np.ndarray
             Augmented patch of the same shape, clipped to [0, 1].
 
         Notes
+        -----
         - Spatial transforms are applied identically across all
           channels and Z-slices (i.e. the same flip/rotate is applied
           to every ``(c, z)`` pair).
@@ -574,7 +595,7 @@ class ZarrPatchDataset(Dataset):
           illumination variability.
         - All transforms are differentiable-friendly (no aliasing).
         """
-        # Spatial augmentations
+        # ── Spatial augmentations ────────────────────────────────────
         # Random horizontal flip
         if random.random() < 0.5:
             patch = np.flip(patch, axis=3).copy()
@@ -593,7 +614,7 @@ class ZarrPatchDataset(Dataset):
         if random.random() < 0.2:
             patch = self._elastic_deform(patch, alpha=8, sigma=3)
 
-        # Intensity augmentations (per-channel)
+        # ── Intensity augmentations (per-channel) ────────────────────
         # These are critical for fluorescence microscopy to make the
         # model robust to staining variability, photobleaching, and
         # illumination differences.
@@ -658,6 +679,7 @@ class ZarrPatchDataset(Dataset):
         (since they share spatial coordinates).
 
         Parameters
+        ----------
         patch : np.ndarray
             Shape ``(C, Z, H, W)``.
         alpha : float
@@ -666,6 +688,7 @@ class ZarrPatchDataset(Dataset):
             Gaussian smoothing for displacement field.
 
         Returns
+        -------
         np.ndarray
             Deformed patch of same shape.
         """
@@ -710,12 +733,14 @@ class ZarrPatchDataset(Dataset):
         noise.  The same region is erased across all channels/Z-slices.
 
         Parameters
+        ----------
         patch : np.ndarray
             Shape ``(C, Z, H, W)``.
         area_ratio_range : tuple
             (min, max) fraction of total spatial area to erase.
 
         Returns
+        -------
         np.ndarray
             Patch with erased region.
         """
@@ -741,7 +766,9 @@ class ZarrPatchDataset(Dataset):
 
         return patch
 
+    # -----------------------------------------------------------------
     # SSD pre-download + RAM pre-loading
+    # -----------------------------------------------------------------
 
     def preload_data(
         self,
@@ -756,7 +783,7 @@ class ZarrPatchDataset(Dataset):
 
         Two phases:
           1. **Download**: Multi-threaded download of all zarr stores
-             from S3 to ``cache_dir`` (default: ``YOUR_LOCAL_CACHE_DIR``).
+             from S3 to ``local_cache_dir`` (default: ``/tmp/zarr_cache``).
              Skips stores that are already on disk.
           2. **RAM load**: Open each local zarr store and read the
              raw data array (only needed channels) into a numpy array
@@ -770,6 +797,7 @@ class ZarrPatchDataset(Dataset):
         all data is on local SSD after Phase 1).
 
         Parameters
+        ----------
         max_workers : int
             Number of parallel download / load threads.
         max_ram_gb : float
@@ -785,6 +813,7 @@ class ZarrPatchDataset(Dataset):
         """
         if self._is_preloaded:
             logger.info("Data already pre-loaded, skipping.")
+            print("[PRELOAD] Data already pre-loaded, skipping.", flush=True)
             return
 
         # Collect unique zarr_keys from patch index
@@ -793,20 +822,32 @@ class ZarrPatchDataset(Dataset):
             "Pre-loading %d zarr stores (max_workers=%d) ...",
             len(zarr_keys), max_workers,
         )
+        print(
+            f"[PRELOAD] Pre-loading {len(zarr_keys)} zarr stores "
+            f"(max_workers={max_workers}) ...",
+            flush=True,
+        )
 
         fs = self._get_fs()
         t0 = time.time()
 
+        # ==================================================================
         # Phase 1: Download zarr stores from S3 to local SSD
+        # ==================================================================
         if self._local_cache_dir is not None:
             self._local_cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(
                 "Phase 1: Downloading zarr stores to %s ...",
                 self._local_cache_dir,
             )
+            print(
+                f"[PRELOAD PHASE 1] Downloading zarr stores to "
+                f"{self._local_cache_dir} ...",
+                flush=True,
+            )
 
             def _download_store(zarr_key: str) -> str:
-                s3_path = f"{self.storage_name}/{zarr_key}"
+                s3_path = f"{self.bucket_name}/{zarr_key}"
                 local_path = self._local_cache_dir / zarr_key
 
                 # Validate existing cache: a valid zarr store must have
@@ -857,19 +898,32 @@ class ZarrPatchDataset(Dataset):
                             "  Downloaded %d/%d stores ...",
                             done_count, len(zarr_keys),
                         )
+                        print(
+                            f"[PRELOAD PHASE 1]   {done_count}/{len(zarr_keys)} "
+                            f"stores downloaded ...",
+                            flush=True,
+                        )
 
             dl_time = time.time() - t0
             logger.info(
                 "Phase 1 complete: %d stores downloaded in %.1f seconds.",
                 len(zarr_keys), dl_time,
             )
+            print(
+                f"[PRELOAD PHASE 1] Complete! {len(zarr_keys)} stores "
+                f"in {dl_time:.0f}s",
+                flush=True,
+            )
 
+        # ==================================================================
         # Phase 2: Load raw data arrays into RAM (only needed channels)
+        # ==================================================================
         # NOTE: We only load the channels required by the current model
         # type (self._channels_to_load), NOT the full (C, Z, Y, X) array.
         # This halves RAM usage for Model A/B and prevents OOM kills.
         # IMPORTANT: The cache stores RAW (unnormalized) data.
         # Normalization is applied per-patch in __getitem__.
+        # ==================================================================
         if self._preload_to_ram:
             t1 = time.time()
 
@@ -878,8 +932,12 @@ class ZarrPatchDataset(Dataset):
                 (p.zarr_path, p.fov_id, p.is_store_fov) for p in self.patches
             ))
             logger.info("Phase 2: Loading %d FOVs into RAM ...", len(fov_keys))
+            print(
+                f"[PRELOAD PHASE 2] Loading {len(fov_keys)} FOVs into RAM ...",
+                flush=True,
+            )
 
-            # RAM budget check before loading
+            # ---- RAM budget check before loading ----
             # Estimate per-FOV RAM: C_needed × target_z × fov_size² × 4 bytes
             _est_bytes_per_fov = (
                 len(self._channels_to_load)
@@ -902,18 +960,29 @@ class ZarrPatchDataset(Dataset):
                     "local SSD from Phase 1).  Training will still be fast!",
                     _est_total_gb, max_ram_gb,
                 )
+                print(
+                    f"[PRELOAD PHASE 2] SKIPPED: estimated {_est_total_gb:.1f} GB "
+                    f"exceeds max_ram_gb={max_ram_gb:.1f}. "
+                    f"Using SSD-only reads.",
+                    flush=True,
+                )
                 self._is_preloaded = True
                 total_time = time.time() - t0
                 logger.info(
                     "Pre-loading finished in %.1f seconds (SSD-only mode).",
                     total_time,
                 )
+                print(
+                    f"[PRELOAD] Finished in {total_time:.0f}s. "
+                    f"SSD-only mode — training reads from local disk.",
+                    flush=True,
+                )
                 return
 
             def _load_fov(
                 zarr_key: str, fov_id: str, is_store_fov: bool
             ) -> Tuple[Tuple[str, str], Optional[np.ndarray]]:
-                # Open zarr store prefer local copy, fall back to S3
+                # Open zarr store -- prefer local copy, fall back to S3
                 if (self._local_cache_dir is not None
                         and (self._local_cache_dir / zarr_key).exists()):
                     root = zarr.open(
@@ -975,12 +1044,24 @@ class ZarrPatchDataset(Dataset):
                 "(%d/%d FOVs).",
                 total_gb, load_time, n_loaded, len(fov_keys),
             )
+            print(
+                f"[PRELOAD PHASE 2] Complete! {total_gb:.1f} GB loaded "
+                f"into RAM in {load_time:.0f}s ({n_loaded}/{len(fov_keys)} FOVs)",
+                flush=True,
+            )
 
         self._is_preloaded = True
         total_time = time.time() - t0
         logger.info("Pre-loading finished in %.1f seconds.", total_time)
+        print(
+            f"[PRELOAD] Finished in {total_time:.0f}s. "
+            f"Training will now be fast!",
+            flush=True,
+        )
 
+    # -----------------------------------------------------------------
     # MinIO / s3fs connection
+    # -----------------------------------------------------------------
 
     def _get_fs(self) -> s3fs.S3FileSystem:
         """Return a (new) s3fs filesystem."""
@@ -991,7 +1072,9 @@ class ZarrPatchDataset(Dataset):
             secure=self.secure,
         )
 
+    # -----------------------------------------------------------------
     # Zarr root cache
+    # -----------------------------------------------------------------
 
     def _get_zarr_root(self, zarr_key: str) -> zarr.Group:
         """Open a zarr root, preferring the local SSD cache if available."""
@@ -1007,14 +1090,16 @@ class ZarrPatchDataset(Dataset):
             return self._zarr_cache[zarr_key]
 
         fs = self._get_fs()
-        root = _open_zarr_root(fs, self.storage_name, zarr_key)
+        root = _open_zarr_root(fs, self.bucket_name, zarr_key)
 
         self._zarr_cache[zarr_key] = root
         if len(self._zarr_cache) > self._cache_max:
             self._zarr_cache.popitem(last=False)
         return root
 
+    # -----------------------------------------------------------------
     # MinIO discovery
+    # -----------------------------------------------------------------
 
     def _is_zarr_store(self, fs: s3fs.S3FileSystem, s3_path: str) -> bool:
         """Check whether *s3_path* points to a valid zarr store."""
@@ -1025,24 +1110,24 @@ class ZarrPatchDataset(Dataset):
         )
 
     def _discover_zarr_stores(self) -> List[Dict[str, str]]:
-        """Walk the MinIO storage and return a list of dicts describing stores."""
+        """Walk the MinIO bucket and return a list of dicts describing stores."""
         fs = self._get_fs()
-        prefix = self.base_prefix + "/"
+        prefix = self.base_folder + "/"
         stores: List[Dict[str, str]] = []
 
         for grp in self.groups:
             for reg in self.regions:
                 folder_prefix = f"{prefix}{grp}/{reg}/"
-                storage_prefix = f"{self.storage_name}/{folder_prefix}"
+                bucket_prefix = f"{self.bucket_name}/{folder_prefix}"
 
                 try:
-                    patient_entries = fs.ls(storage_prefix, detail=False)
+                    patient_entries = fs.ls(bucket_prefix, detail=False)
                 except FileNotFoundError:
                     logger.warning("Folder not found: %s", folder_prefix)
                     continue
 
                 for pe in patient_entries:
-                    rel = pe.removeprefix(self.storage_name + "/").rstrip("/")
+                    rel = pe.removeprefix(self.bucket_name + "/").rstrip("/")
                     entry_name = rel.replace(folder_prefix.rstrip("/"), "").strip("/")
                     if not entry_name or entry_name.startswith("."):
                         continue
@@ -1051,7 +1136,7 @@ class ZarrPatchDataset(Dataset):
                     if patient_id.endswith(".zarr"):
                         patient_id = patient_id[: -len(".zarr")]
 
-                    s3_path = f"{self.storage_name}/{rel}"
+                    s3_path = f"{self.bucket_name}/{rel}"
 
                     if self._is_zarr_store(fs, s3_path):
                         stores.append({
@@ -1068,7 +1153,7 @@ class ZarrPatchDataset(Dataset):
                         continue
 
                     for fe in fov_entries:
-                        fov_rel = fe.removeprefix(self.storage_name + "/").rstrip("/")
+                        fov_rel = fe.removeprefix(self.bucket_name + "/").rstrip("/")
                         fov_name = fov_rel.replace(rel + "/", "").strip("/")
                         if not fov_name or fov_name.startswith("."):
                             continue
@@ -1097,11 +1182,11 @@ class ZarrPatchDataset(Dataset):
         fovs: List[str] = []
 
         try:
-            all_keys = fs.ls(f"{self.storage_name}/{zarr_key}", detail=False)
+            all_keys = fs.ls(f"{self.bucket_name}/{zarr_key}", detail=False)
         except FileNotFoundError:
             return fovs
 
-        rel_keys = [k.removeprefix(self.storage_name + "/") for k in all_keys]
+        rel_keys = [k.removeprefix(self.bucket_name + "/") for k in all_keys]
         prefix = zarr_key.rstrip("/") + "/"
 
         subdirs: set[str] = set()
@@ -1125,7 +1210,9 @@ class ZarrPatchDataset(Dataset):
 
         return fovs
 
+    # -----------------------------------------------------------------
     # Empty-patch detection
+    # -----------------------------------------------------------------
 
     def _is_patch_empty(
         self,
@@ -1168,7 +1255,9 @@ class ZarrPatchDataset(Dataset):
 
         return (not protein_has_signal) and (not cell_has_signal)
 
+    # -----------------------------------------------------------------
     # Index building
+    # -----------------------------------------------------------------
 
     def _build_index(self) -> None:
         """Walk all OME-Zarr stores, compute patch coordinates, check emptiness."""
@@ -1264,13 +1353,15 @@ class ZarrPatchDataset(Dataset):
             elapsed, total_patches, empty_count, len(self.patches),
         )
 
+    # -----------------------------------------------------------------
     # Index persistence
+    # -----------------------------------------------------------------
 
     def _save_index(self, path: Path) -> None:
         """Serialize ``self.patches`` to a JSON file."""
         data = {
             "config": {
-                "base_prefix": self.base_prefix,
+                "base_folder": self.base_folder,
                 "model_type": self.model_type,
                 "patch_size": self.patch_size,
                 "target_z": self.target_z,
@@ -1312,7 +1403,7 @@ class ZarrPatchDataset(Dataset):
 
         all_patches = [PatchMeta.from_dict(d) for d in data["patches"]]
 
-        # Filter by regions and groups
+        # ── Filter by regions and groups ────────────────────────
         # The cached index may contain patches from ALL regions and
         # groups.  We must keep only those matching the current
         # configuration to prevent region mixing.
@@ -1338,7 +1429,9 @@ class ZarrPatchDataset(Dataset):
 
         logger.info("Loaded %d patches from %s", len(self.patches), path)
 
+    # -----------------------------------------------------------------
     # Data loading (per-patch)
+    # -----------------------------------------------------------------
 
     def _load_raw_patch_from_cache(
         self,
@@ -1430,7 +1523,7 @@ class ZarrPatchDataset(Dataset):
 
         fov_root = root if (fov_id == "root" or is_store_fov) else root[fov_id]
 
-        # Robust data array access
+        # ── Robust data array access ────────────────────────────────
         # OME-Zarr stores typically put the highest-resolution data
         # under key "0", but some stores use a different layout.
         # We try "0" first, then fall back to scanning for the first
@@ -1475,14 +1568,17 @@ class ZarrPatchDataset(Dataset):
         the expected shape pattern ``(C, Z, Y, X)``.
 
         Parameters
+        ----------
         fov_root : zarr.Group
             The FOV group to search.
 
         Returns
+        -------
         zarr.Array
             The data array of shape ``(C, Z, Y, X)``.
 
         Raises
+        ------
         KeyError
             If no suitable data array can be found.
         """
@@ -1547,7 +1643,9 @@ class ZarrPatchDataset(Dataset):
             mode="constant", constant_values=0,
         )
 
+    # -----------------------------------------------------------------
     # Dataset interface
+    # -----------------------------------------------------------------
 
     def __len__(self) -> int:
         return len(self.patches)
@@ -1621,7 +1719,9 @@ class ZarrPatchDataset(Dataset):
 
         return tensor, meta_dict
 
+    # -----------------------------------------------------------------
     # Convenience helpers
+    # -----------------------------------------------------------------
 
     def get_labels(self) -> torch.Tensor:
         """Return a 1-D int tensor of labels (0=HC, 1=PD) for all patches."""
@@ -1672,16 +1772,16 @@ class ZarrPatchDataset(Dataset):
 
 
 
-# Collate helper for use with DataLoader
+# Collate helper -- for use with DataLoader
 
 
 def ensure_zarr_data_local(
     minio_endpoint: str,
     minio_access_key: str,
     minio_secret_key: str,
-    storage_name: str = "YOUR_STORAGE_NAME",
-    base_prefix: str = "YOUR_BASE_PREFIX",
-    cache_dir: str = "YOUR_LOCAL_CACHE_DIR",
+    bucket_name: str = "YOUR_STORAGE_NAME",
+    base_folder: str = "YOUR_BASE_PREFIX",
+    local_cache_dir: str = "/tmp/zarr_cache",
     max_workers: int = 8,
     clearml_dataset_project: Optional[str] = None,
     clearml_dataset_name: Optional[str] = None,
@@ -1692,21 +1792,23 @@ def ensure_zarr_data_local(
     Ensure zarr data is available on local SSD.
 
     Strategy (pick first available):
-      1. Check if data already exists in ``cache_dir`` on disk.
+      1. Check if data already exists in ``local_cache_dir`` on disk.
       2. Multi-threaded download from S3 (MinIO).
 
     NOTE: ClearML Dataset upload is intentionally DISABLED.  Uploading
     ~25 GB of zarr data to ClearML storage via HTTPS takes many hours
     and is redundant -- the data already lives on MinIO S3, which is
     much faster to download from.  The local SSD cache at
-    ``cache_dir`` persists across tasks on the same agent, so
+    ``local_cache_dir`` persists across tasks on the same agent, so
     re-downloads are only needed on the first run.
 
     Returns the local path where zarr data is available.
     """
-    cache_path = Path(cache_dir)
+    cache_path = Path(local_cache_dir)
 
+    # ------------------------------------------------------------------
     # Strategy 1: Data already on disk from a previous run
+    # ------------------------------------------------------------------
     if cache_path.exists() and any(cache_path.iterdir()):
         n_items = sum(1 for _ in cache_path.rglob(".zgroup"))
         if n_items > 0:
@@ -1715,39 +1817,51 @@ def ensure_zarr_data_local(
                 "Skipping download.",
                 cache_path, n_items,
             )
+            print(
+                f"[CACHE HIT] Zarr data already on disk at {cache_path} "
+                f"({n_items} stores). No download needed!",
+                flush=True,
+            )
             return str(cache_path)
 
+    # ------------------------------------------------------------------
     # Strategy 2: Multi-threaded download from S3 (MinIO)
+    # ------------------------------------------------------------------
     logger.info(
         "No local cache found. Downloading zarr stores from S3 "
         "with %d workers ...",
         max_workers,
     )
+    print(
+        f"[S3 DOWNLOAD] No local cache found. "
+        f"Downloading zarr stores from S3 with {max_workers} workers ...",
+        flush=True,
+    )
     fs = _make_s3fs(minio_endpoint, minio_access_key, minio_secret_key)
     regions = regions or ["putamen", "substantiaNigra"]
     groups = groups or ["HC", "PD"]
-    base_prefix = base_prefix.rstrip("/")
+    base_folder = base_folder.rstrip("/")
 
     # Discover all zarr stores on S3
     all_zarr_keys: List[str] = []
     for grp in groups:
         for reg in regions:
-            folder_prefix = f"{base_prefix}/{grp}/{reg}/"
-            storage_prefix = f"{storage_name}/{folder_prefix}"
+            folder_prefix = f"{base_folder}/{grp}/{reg}/"
+            bucket_prefix = f"{bucket_name}/{folder_prefix}"
             try:
-                entries = fs.ls(storage_prefix, detail=False)
+                entries = fs.ls(bucket_prefix, detail=False)
             except FileNotFoundError:
                 logger.warning("Folder not found on S3: %s", folder_prefix)
                 continue
 
             for entry in entries:
-                rel = entry.removeprefix(storage_name + "/").rstrip("/")
+                rel = entry.removeprefix(bucket_name + "/").rstrip("/")
                 entry_name = rel.replace(folder_prefix.rstrip("/"), "").strip("/")
                 if not entry_name or entry_name.startswith("."):
                     continue
 
                 # Check if this is a zarr store directly
-                s3_path = f"{storage_name}/{rel}"
+                s3_path = f"{bucket_name}/{rel}"
                 if _is_zarr_store_static(fs, s3_path):
                     all_zarr_keys.append(rel)
                     continue
@@ -1758,7 +1872,7 @@ def ensure_zarr_data_local(
                 except FileNotFoundError:
                     continue
                 for sub in sub_entries:
-                    sub_rel = sub.removeprefix(storage_name + "/").rstrip("/")
+                    sub_rel = sub.removeprefix(bucket_name + "/").rstrip("/")
                     sub_name = sub_rel.replace(rel + "/", "").strip("/")
                     if not sub_name or sub_name.startswith("."):
                         continue
@@ -1766,13 +1880,17 @@ def ensure_zarr_data_local(
                         all_zarr_keys.append(sub_rel)
 
     logger.info("Discovered %d zarr stores on S3.", len(all_zarr_keys))
+    print(
+        f"[S3 DOWNLOAD] Discovered {len(all_zarr_keys)} zarr stores on S3.",
+        flush=True,
+    )
 
     # Multi-threaded download
     cache_path.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
     def _download_one(zarr_key: str) -> str:
-        s3_path = f"{storage_name}/{zarr_key}"
+        s3_path = f"{bucket_name}/{zarr_key}"
         local_path = cache_path / zarr_key
 
         # Validate existing cache: must contain zarr metadata files.
@@ -1817,11 +1935,19 @@ def ensure_zarr_data_local(
                 logger.error("Download failed for %s: %s", futures[f], e)
             if done % 5 == 0 or done == len(all_zarr_keys):
                 logger.info("  Downloaded %d/%d stores ...", done, len(all_zarr_keys))
+                print(
+                    f"[S3 DOWNLOAD]   {done}/{len(all_zarr_keys)} stores downloaded ...",
+                    flush=True,
+                )
 
     dl_time = time.time() - t0
     logger.info(
         "S3 download complete: %d stores in %.1f seconds.",
         len(all_zarr_keys), dl_time,
+    )
+    print(
+        f"[S3 DOWNLOAD] Complete! {len(all_zarr_keys)} stores in {dl_time:.0f}s",
+        flush=True,
     )
 
     return str(cache_path)
@@ -1866,7 +1992,7 @@ if __name__ == "__main__":
     Task.add_requirements("s3fs")
 
     task = Task.init(
-        project_name="YOUR_CLEARML_PROJECT",
+        project_name="YOUR_STORAGE_NAME/Data_Download",
         task_name="Step_2.1_Patch_Indexing",
     )
 
@@ -1882,7 +2008,7 @@ if __name__ == "__main__":
     MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "YOUR_MINIO_SECRET_KEY")
 
     LOCAL_INDEX_PATH = "patch_index.json"
-    MINIO_INDEX_BACKUP = "YOUR_OUTPUT_PREFIX/_system/patch_index_C.json"
+    MINIO_INDEX_BACKUP = "YOUR_STORAGE_NAME/YOUR_BASE_PREFIX/_system/patch_index_C.json"
 
     if not os.path.exists(LOCAL_INDEX_PATH):
         logger.info("Local index not found. Trying to download from MinIO backup...")
@@ -1900,8 +2026,8 @@ if __name__ == "__main__":
         minio_endpoint=MINIO_ENDPOINT,
         minio_access_key=MINIO_ACCESS_KEY,
         minio_secret_key=MINIO_SECRET_KEY,
-        storage_name="YOUR_STORAGE_NAME",
-        base_prefix="YOUR_BASE_PREFIX",
+        bucket_name="YOUR_STORAGE_NAME",
+        base_folder="YOUR_BASE_PREFIX",
         model_type="C",
         patch_size=256,
         target_z=25,
