@@ -86,14 +86,21 @@ The framework is designed to serve both as:
 │   ├── zarr_patch_dataset.py
 │   ├── intensity_normalization.py
 │   ├── train_unified_5fold.py
-│   ├── train_final_and_gradcam.py
-│   └── test_CAM.py
+│   ├── gradcam_heldout.py
+│   ├── launch_training.py
+│   └── launch_xai.py
 │
-└── SPP
-    ├── cc3d_utils.py
-    ├── cc3d_production.py
-    ├── cc3d_test_napari.py
-    └── spp_analysis.py
+├── SPP
+│   ├── cc3d_utils.py
+│   ├── cc3d_production.py
+│   ├── cc3d_test_napari.py
+│   └── spp_analysis.py
+│
+└── analysis
+    ├── pooled_oof_metrics.py
+    ├── spatial_statistics.py
+    ├── xai_quantification.py
+    └── make_figures.py
 ```
 
 ---
@@ -171,12 +178,24 @@ Perform cross-validation and model evaluation.
 ### 4. Generate Explainability Maps
 
 ```bash
-python test_CAM.py
+python gradcam_heldout.py
 ```
 
-Produce Grad-CAM visualizations and activation maps.
+Produce Grad-CAM visualizations and activation maps on held-out donors.
 
-### 5. Inspect Results in 3D
+### 5. Compute Reported Metrics
+
+```bash
+python analysis/pooled_oof_metrics.py
+python analysis/spatial_statistics.py
+python analysis/xai_quantification.py
+python analysis/make_figures.py
+```
+
+Pooled out-of-fold metrics, spatial statistics, interpretability quantification
+and figures.
+
+### 6. Inspect Results in 3D
 
 ```bash
 python cc3d_test_napari.py
